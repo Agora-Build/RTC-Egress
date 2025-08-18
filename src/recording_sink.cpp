@@ -4,9 +4,13 @@
 
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
+#include <sched.h>         // For sched_setscheduler
+#include <sys/resource.h>  // For setpriority
 #include <sys/stat.h>
+#include <unistd.h>  // For getpid, syscall
 
 #include <algorithm>
+#include <cerrno>  // For errno
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -168,8 +172,18 @@ bool RecordingSink::start() {
         }
     }
 
-    // Create recording thread
+    // Create recording thread for main coordination
     recordingThread_ = std::make_unique<std::thread>(&RecordingSink::recordingThread, this);
+
+    // Always create separate audio and video processing threads
+    if (config_.recordAudio) {
+        audioProcessingThread_ =
+            std::make_unique<std::thread>(&RecordingSink::audioProcessingThreadLoop, this);
+    }
+    if (config_.recordVideo) {
+        videoProcessingThread_ =
+            std::make_unique<std::thread>(&RecordingSink::videoProcessingThreadLoop, this);
+    }
 
     AG_LOG_FAST(INFO, "Started recording in %s mode",
                 (config_.mode == VideoCompositor::Mode::Composite ? "composite" : "individual"));
@@ -257,13 +271,27 @@ void RecordingSink::stop() {
         metadataManager_->endSession(config_.taskId, "normal");
     }
 
+    // Join audio processing thread first (highest priority)
+    if (audioProcessingThread_ && audioProcessingThread_->joinable()) {
+        AG_LOG_TS(INFO, "About to join audio processing thread...");
+        audioProcessingThread_->join();
+        AG_LOG_TS(INFO, "Audio processing thread joined successfully");
+        audioProcessingThread_.reset();
+    }
+
+    // Join video processing thread
+    if (videoProcessingThread_ && videoProcessingThread_->joinable()) {
+        AG_LOG_TS(INFO, "About to join video processing thread...");
+        videoProcessingThread_->join();
+        AG_LOG_TS(INFO, "Video processing thread joined successfully");
+        videoProcessingThread_.reset();
+    }
+
+    // Join main recording thread
     if (recordingThread_ && recordingThread_->joinable()) {
         AG_LOG_TS(INFO, "About to join recording thread...");
-
         recordingThread_->join();
-
         AG_LOG_TS(INFO, "Recording thread joined successfully");
-
         recordingThread_.reset();
     }
 
@@ -439,15 +467,8 @@ void RecordingSink::recordingThread() {
     AG_LOG_FAST(INFO, "Recording thread started");
 
     while (!stopRequested_.load()) {
-        // Process video frames
-        if (config_.recordVideo) {
-            processVideoFrames();
-        }
-
-        // Process audio frames
-        if (config_.recordAudio) {
-            processAudioFrames();
-        }
+        // Coordinate tasks while dedicated A/V threads handle frame processing
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         // Check for TS segment rotation
         if (config_.format == OutputFormat::TS && tsSegmentManager_) {
@@ -828,10 +849,23 @@ bool RecordingSink::encodeVideoFrame(const VideoFrame& frame, const std::string&
             it = userContexts_.find(userId);
         }
 
-        return encodeIndividualFrame(frame, it->second.get());
+        bool result = encodeIndividualFrame(frame, it->second.get());
+
+        // Validate A/V sync after successful video encoding (individual mode)
+        if (result) {
+            validateAVSync(it->second.get(), userId);
+        }
+
+        return result;
     } else {
         // Composite mode - update composite buffer and potentially create composite frame
         bool result = updateCompositeFrame(frame, userId);
+
+        // Validate A/V sync for composite mode (use composite context)
+        if (result && compositeContext_) {
+            validateAVSync(compositeContext_.get(), "composite");
+        }
+
         return result;
     }
 }
@@ -1361,6 +1395,22 @@ bool RecordingSink::encodeIndividualAudioFrame(const AudioFrame& frame, UserCont
     }
 
     av_packet_free(&packet);
+
+    // Validate A/V sync after successful audio encoding
+    if (userId == "composite") {
+        // Composite mode - validate using composite context
+        if (compositeContext_) {
+            validateAVSync(compositeContext_.get(), userId);
+        }
+    } else {
+        // Individual mode - validate using user context
+        std::lock_guard<std::mutex> contextLock(userContextsMutex_);
+        auto contextIt = userContexts_.find(userId);
+        if (contextIt != userContexts_.end()) {
+            validateAVSync(contextIt->second.get(), userId);
+        }
+    }
+
     return true;
 }
 
@@ -1550,6 +1600,9 @@ std::pair<int, int> RecordingSink::calculateOptimalLayout(int numUsers) {
 
 bool RecordingSink::writePacket(AVPacket* packet, AVFormatContext* formatContext,
                                 AVStream* stream) {
+    // Thread-safe packet writing (critical for concurrent audio/video threads)
+    std::lock_guard<std::mutex> lock(writePacketMutex_);
+
     // Write packet using interleaved write for proper timestamp ordering
     int ret = av_interleaved_write_frame(formatContext, packet);
     if (ret < 0) {
@@ -2116,6 +2169,7 @@ void RecordingSink::cleanupCompositeResources() {
 // ========== RTC Timestamp Synchronization Core Implementation ==========
 
 void RecordingSink::initializeRtcTimeOrigin(UserContext* context, uint64_t rtcTimestamp) {
+    std::lock_guard<std::mutex> lock(timeOriginMutex_);
     if (!context->hasTimeOrigin) {
         context->rtcTimeOrigin = rtcTimestamp;
         context->hasTimeOrigin = true;
@@ -2133,9 +2187,17 @@ int64_t RecordingSink::calculateVideoPTS(UserContext* context, uint64_t rtcTimes
     // Convert to 90kHz time base (FFmpeg standard)
     int64_t pts = relativeMs * 90;  // 1ms = 90 ticks @ 90kHz
 
-    // Ensure monotonic increment
-    int64_t minIncrement = 90000 / config_.videoFps;  // Time interval per frame
-    pts = ensureMonotonicPTS(pts, context->lastVideoPts, minIncrement);
+    // Thread-safe PTS calculation and tracking
+    {
+        std::lock_guard<std::mutex> lock(ptsTrackingMutex_);
+
+        // Ensure monotonic increment
+        int64_t minIncrement = 90000 / config_.videoFps;  // Time interval per frame
+        pts = ensureMonotonicPTS(pts, context->lastVideoPts, minIncrement);
+
+        // Update last video PTS
+        context->lastVideoPts = pts;
+    }
 
     static int log_count = 0;
     if (log_count % 30 == 0) {
@@ -2157,12 +2219,20 @@ int64_t RecordingSink::calculateAudioPTS(UserContext* context, uint64_t rtcTimes
     // Convert to 90kHz time base
     int64_t pts = relativeMs * 90;
 
-    // Audio frame time interval (e.g., 1024 samples@48kHz = 21.33ms)
-    int64_t samplesPerFrame = context->audioCodecContext->frame_size;
-    int64_t sampleRate = context->audioCodecContext->sample_rate;
-    int64_t minIncrement = (samplesPerFrame * 90000) / sampleRate;
+    // Thread-safe PTS calculation and tracking
+    {
+        std::lock_guard<std::mutex> lock(ptsTrackingMutex_);
 
-    pts = ensureMonotonicPTS(pts, context->lastAudioPts, minIncrement);
+        // Audio frame time interval (e.g., 1024 samples@48kHz = 21.33ms)
+        int64_t samplesPerFrame = context->audioCodecContext->frame_size;
+        int64_t sampleRate = context->audioCodecContext->sample_rate;
+        int64_t minIncrement = (samplesPerFrame * 90000) / sampleRate;
+
+        pts = ensureMonotonicPTS(pts, context->lastAudioPts, minIncrement);
+
+        // Update last audio PTS
+        context->lastAudioPts = pts;
+    }
 
     static int audio_log_count = 0;
     if (audio_log_count % 50 == 0) {
@@ -2385,6 +2455,115 @@ bool RecordingSink::switchToNewTSSegment(UserContext* context) {
 
     AG_LOG_FAST(INFO, "Successfully switched to new TS segment: %s", newSegmentPath.c_str());
     return true;
+}
+
+void RecordingSink::validateAVSync(UserContext* context, const std::string& userId) {
+    // Validate A/V sync every 5 seconds to avoid excessive logging
+    uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+
+    if (currentTime - lastSyncCheckTime_ < 5000) {
+        return;  // Skip validation if called too recently
+    }
+
+    lastSyncCheckTime_ = currentTime;
+
+    // Check if both audio and video streams are active
+    if (!context->audioStreamActive || !context->videoStreamActive) {
+        return;  // Skip validation if either stream is inactive
+    }
+
+    // Calculate A/V sync drift
+    int64_t syncDrift = abs(context->lastAudioPts - context->lastVideoPts);
+
+    if (syncDrift > SYNC_DRIFT_THRESHOLD) {
+        AG_LOG_FAST(WARN,
+                    "A/V sync drift detected for user %s: %ld ticks (%.2fms) - Audio PTS: %ld, "
+                    "Video PTS: %ld",
+                    userId.c_str(), syncDrift, syncDrift / 90.0, context->lastAudioPts,
+                    context->lastVideoPts);
+
+        // Log timing information for debugging
+        AG_LOG_FAST(INFO, "Sync debug - Audio RTC: %lu, Video RTC: %lu, Time origin: %lu",
+                    context->lastAudioRtcTs, context->lastVideoRtcTs, context->rtcTimeOrigin);
+    } else {
+        AG_LOG_FAST(INFO, "A/V sync good for user %s: drift %ld ticks (%.2fms)", userId.c_str(),
+                    syncDrift, syncDrift / 90.0);
+    }
+}
+
+void RecordingSink::setThreadPriority(int priority, const std::string& threadName) {
+    // Always set priority for separate threads mode
+
+    if (config_.useRealTimeScheduling) {
+        // Use SCHED_FIFO for real-time scheduling (better for audio/video)
+        struct sched_param param;
+        param.sched_priority = priority;
+
+        if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+            // Fall back to nice priority if real-time scheduling fails
+            AG_LOG_FAST(WARN, "Failed to set SCHED_FIFO priority %d for %s thread: %s", priority,
+                        threadName.c_str(), strerror(errno));
+            AG_LOG_FAST(INFO, "Falling back to nice priority for %s thread", threadName.c_str());
+
+            // Convert RT priority (1-99) to nice priority (-20 to 19)
+            int nice_priority = 20 - (priority * 40 / 99);  // Map 99->-20, 1->19
+            if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+                AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                            threadName.c_str(), strerror(errno));
+            } else {
+                AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                            threadName.c_str());
+            }
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set SCHED_FIFO priority %d for %s thread", priority,
+                        threadName.c_str());
+        }
+    } else {
+        // Use traditional nice priority
+        // Convert RT priority (1-99) to nice priority (-20 to 19)
+        int nice_priority = 20 - (priority * 40 / 99);  // Map 99->-20, 1->19
+        if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+            AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                        threadName.c_str(), strerror(errno));
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                        threadName.c_str());
+        }
+    }
+}
+
+void RecordingSink::audioProcessingThreadLoop() {
+    AG_LOG_FAST(INFO, "Audio processing thread started with high priority");
+
+    // Set urgent priority for audio processing thread
+    setThreadPriority(config_.audioPriority, "audio");
+
+    while (!stopRequested_.load()) {
+        processAudioFrames();
+
+        // Synchronized yield time for consistent A/V processing
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    AG_LOG_FAST(INFO, "Audio processing thread exiting");
+}
+
+void RecordingSink::videoProcessingThreadLoop() {
+    AG_LOG_FAST(INFO, "Video processing thread started with high priority");
+
+    // Set high priority for video processing thread
+    setThreadPriority(config_.videoPriority, "video");
+
+    while (!stopRequested_.load()) {
+        processVideoFrames();
+
+        // Synchronized yield time for consistent A/V processing
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    AG_LOG_FAST(INFO, "Video processing thread exiting");
 }
 
 }  // namespace rtc

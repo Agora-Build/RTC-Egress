@@ -70,6 +70,11 @@ class RecordingSink {
         int videoBufferSize = 30;   // frames
         int audioBufferSize = 100;  // frames
 
+        // Thread priority settings (always use separate threads)
+        bool useRealTimeScheduling = true;  // Use SCHED_FIFO for real-time scheduling
+        int audioPriority = 80;             // Audio thread priority (1-99, higher = more urgent)
+        int videoPriority = 70;             // Video thread priority (1-99, higher = more urgent)
+
         // User filtering
         std::vector<std::string> targetUsers;  // Empty means record all users
 
@@ -167,8 +172,16 @@ class RecordingSink {
 
     // Thread functions
     void recordingThread();
+    void audioProcessingThreadLoop();  // Dedicated audio processing loop
+    void videoProcessingThreadLoop();  // Dedicated video processing loop
     void processVideoFrames();
     void processAudioFrames();
+
+    // Priority utilities
+    void setThreadPriority(int priority, const std::string& threadName);
+
+    // A/V sync utilities
+    void validateAVSync(UserContext* context, const std::string& userId);
 
     // FFmpeg setup and cleanup
     bool initializeEncoder(const std::string& userId = "");
@@ -214,6 +227,8 @@ class RecordingSink {
 
     // Threading
     std::unique_ptr<std::thread> recordingThread_;
+    std::unique_ptr<std::thread> audioProcessingThread_;  // Dedicated audio processing thread
+    std::unique_ptr<std::thread> videoProcessingThread_;  // Dedicated video processing thread
     std::mutex mutex_;
     std::condition_variable cv_;
 
@@ -279,6 +294,13 @@ class RecordingSink {
 
     // Timing
     std::chrono::steady_clock::time_point startTime_;
+
+    // A/V sync monitoring and thread safety
+    std::mutex timeOriginMutex_;                // Protect time origin initialization
+    std::mutex ptsTrackingMutex_;               // Protect PTS calculations
+    std::mutex writePacketMutex_;               // Protect concurrent writePacket calls
+    uint64_t lastSyncCheckTime_ = 0;            // Last A/V sync validation time
+    const int64_t SYNC_DRIFT_THRESHOLD = 9000;  // 100ms in 90kHz timebase
 };
 
 }  // namespace rtc
