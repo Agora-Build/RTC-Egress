@@ -117,8 +117,11 @@ bool RtcClient::connect() {
 
     // Create video subscription options
     agora::rtc::VideoSubscriptionOptions subscriptionOptions;
-    subscriptionOptions.type =
-        agora::rtc::VIDEO_STREAM_HIGH;  // Or VIDEO_STREAM_LOW for lower quality
+    subscriptionOptions.type = agora::rtc::VIDEO_STREAM_HIGH;
+    // Subscribe to encoded frames only — we decode them ourselves using ffmpeg.
+    // This prevents the SDK from creating internal decoders which crash (SIGABRT)
+    // when handling multiple simultaneous video streams.
+    subscriptionOptions.encodedFrameOnly = true;
 
     // Subscribe to remote streams
     if (!config_.remoteUserId.empty()) {
@@ -139,31 +142,24 @@ bool RtcClient::connect() {
         }
     }
 
-    // Create and register frame observer to receive video frames
+    // Create and register encoded frame observer to receive H264 frames directly.
+    // We decode them ourselves using ffmpeg to avoid an SDK bug where its internal
+    // decoder crashes (SIGABRT) when creating multiple H264 decoder instances.
     if (videoFrameCallback_) {
         try {
-            frameObserver_ = new YuvFrameObserver(videoFrameCallback_);
-            if (!frameObserver_) {
-                AG_LOG(ERROR, "Failed to create frame observer");
-                return false;
-            }
+            encodedFrameObserver_ = std::make_unique<EncodedFrameDecoder>(videoFrameCallback_);
 
-            frameObserver_->AddRef();  // Add reference for the observer
-
-            // Register the observer with the local user to receive frames from remote users
-            int ret = connection_->getLocalUser()->registerVideoFrameObserver(frameObserver_.get());
+            int ret = connection_->getLocalUser()->registerVideoEncodedFrameObserver(
+                encodedFrameObserver_.get());
             if (ret != 0) {
-                AG_LOG(ERROR, "Failed to register video frame observer, error: %d", ret);
-                frameObserver_->Release();
-                frameObserver_ = nullptr;
+                AG_LOG(ERROR, "Failed to register encoded video frame observer, error: %d", ret);
+                encodedFrameObserver_.reset();
                 return false;
             }
+            AG_LOG(INFO, "Registered encoded video frame observer (bypassing SDK decoder)");
         } catch (const std::exception& e) {
-            AG_LOG(ERROR, "Exception creating frame observer: %s", e.what());
-            if (frameObserver_) {
-                frameObserver_->Release();
-                frameObserver_ = nullptr;
-            }
+            AG_LOG(ERROR, "Exception creating encoded frame observer: %s", e.what());
+            encodedFrameObserver_.reset();
             return false;
         }
     }
@@ -258,6 +254,16 @@ void RtcClient::disconnect() {
 
     try {
         // Clean up frame observers FIRST before touching connection
+        if (encodedFrameObserver_ && connection_) {
+            try {
+                connection_->getLocalUser()->unregisterVideoEncodedFrameObserver(
+                    encodedFrameObserver_.get());
+            } catch (const std::exception& e) {
+                AG_LOG_TS(ERROR, "Exception unregistering encoded frame observer: %s", e.what());
+            }
+            encodedFrameObserver_.reset();
+        }
+
         if (frameObserver_ && connection_) {
             try {
                 connection_->getLocalUser()->unregisterVideoFrameObserver(frameObserver_.get());

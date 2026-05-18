@@ -1,5 +1,6 @@
 #define AG_LOG_TAG "Main"
 
+#include <execinfo.h>  // For backtrace
 #include <sys/socket.h>
 #include <sys/stat.h>  // For mkdir
 #include <sys/un.h>
@@ -18,6 +19,16 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+
+static void crashHandler(int sig) {
+    fprintf(stderr, "\n=== CRASH: Signal %d ===\n", sig);
+    void* frames[64];
+    int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    fprintf(stderr, "=== END CRASH ===\n");
+    fflush(stderr);
+    _exit(128 + sig);
+}
 
 #include "common/log.h"
 #include "common/opt_parser.h"
@@ -61,6 +72,11 @@ void signal_handler(int signal) {
 }
 
 int main(int argc, char* argv[]) {
+    signal(SIGSEGV, crashHandler);
+    signal(SIGABRT, crashHandler);
+    signal(SIGFPE, crashHandler);
+    signal(SIGBUS, crashHandler);
+
     std::string config_file;
     std::string socket_path;
     bool show_help = false;

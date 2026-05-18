@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 
+#include "encoded_frame_decoder.h"
 #include "layout_detector.h"
 #include "snapshot_encoder.h"
 #include "video_compositor.h"
@@ -235,6 +236,7 @@ class RtcClient {
     agora::agora_refptr<agora::rtc::IVideoMixerSource> videoMixer_;
     agora::agora_refptr<agora::rtc::ILocalVideoTrack> videoTrack_;
     agora::agora_refptr<YuvFrameObserver> frameObserver_;
+    std::unique_ptr<EncodedFrameDecoder> encodedFrameObserver_;
     agora::agora_refptr<AudioFrameObserver> audioObserver_;
 
     // Forward declaration for TaskConnectionObserver from agora::egress namespace
