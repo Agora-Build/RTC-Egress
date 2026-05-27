@@ -328,12 +328,6 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
             return;
         }
 
-        // Ensure we're connected to the channel
-        if (!ensureConnected(msg.channel, msg.access_token)) {
-            logError("Failed to connect to channel: " + msg.channel, instance_id_);
-            return;
-        }
-
         // Update configs with channel and task information
         recording_config_.channel = msg.channel;
         recording_config_.taskId = msg.task_id;
@@ -374,7 +368,7 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
             resolvedMode = 1;
         }
 
-        // Set decode mode on RTC client config and recording sink config
+        // Set decode mode BEFORE connecting so observers are registered correctly
         rtc_client_->config().videoDecodeMode = decodeMode;
         recording_config_.videoDecodeMode = resolvedMode;
         logInfo(
@@ -384,6 +378,12 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
                      : (decodeMode == agora::rtc::VideoDecodeMode::SdkDecode ? "sdk" : "ffmpeg")) +
                 ")",
             instance_id_);
+
+        // Connect to channel (uses decode mode set above for observer registration)
+        if (!ensureConnected(msg.channel, msg.access_token)) {
+            logError("Failed to connect to channel: " + msg.channel, instance_id_);
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = channel_states_[msg.channel];
