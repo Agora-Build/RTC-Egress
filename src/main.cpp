@@ -441,6 +441,18 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Read video decode mode from config: 0=passthrough, 1=ffmpeg(default), 2=sdk
+            if (recording_node["video"] && recording_node["video"]["decode_mode"]) {
+                int mode = recording_node["video"]["decode_mode"].as<int>();
+                if (mode == 0) {
+                    rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::Passthrough;
+                } else if (mode == 2) {
+                    rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::SdkDecode;
+                } else {
+                    rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+                }
+            }
+
             // Determine recording mode based on user configuration
             if (userList.size() == 1) {
                 // Single user - individual recording (only record this specific user)
@@ -466,6 +478,29 @@ int main(int argc, char* argv[]) {
 
             // Set target users for recording
             recording_config.targetUsers = userList;
+
+            // Validate: passthrough only works with individual mode
+            if (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::Passthrough &&
+                recording_config.mode == agora::rtc::VideoCompositor::Mode::Composite) {
+                AG_LOG_FAST(WARN,
+                            "Passthrough decode mode not supported with composite layout, "
+                            "falling back to ffmpeg decode");
+                rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+            }
+
+            AG_LOG_FAST(INFO, "[Config] Video decode mode: %s",
+                        rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::Passthrough
+                            ? "passthrough"
+                            : (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::SdkDecode
+                                   ? "sdk"
+                                   : "ffmpeg"));
+
+            // Pass decode mode to recording sink config
+            recording_config.videoDecodeMode =
+                (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::Passthrough)
+                    ? 0
+                    : (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::SdkDecode ? 2
+                                                                                            : 1);
 
             if (recording_node["format"]) {
                 std::string format = recording_node["format"].as<std::string>();
@@ -644,6 +679,18 @@ int main(int argc, char* argv[]) {
                         frame.vStride, frame.width, frame.height, frame.renderTimeMs, userId);
                 }
             });
+
+        // Set up encoded video frame callback for passthrough mode
+        if (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::Passthrough) {
+            g_rtcClient->setEncodedVideoFrameCallback(
+                [](uint32_t uid, const uint8_t* data, size_t length,
+                   const agora::rtc::EncodedVideoFrameInfo& info) {
+                    if (!g_running) return;
+                    if (g_recordingSink && g_recordingSink->isRecording()) {
+                        g_recordingSink->onEncodedVideoFrame(uid, data, length, info);
+                    }
+                });
+        }
 
         // Set up audio frame callback
         g_rtcClient->setAudioFrameCallback(

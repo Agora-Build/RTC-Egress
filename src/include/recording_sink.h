@@ -1,5 +1,7 @@
 #pragma once
 
+#include <AgoraBase.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -78,6 +80,9 @@ class RecordingSink {
         bool tsGeneratePlaylist = true;        // Generate HLS playlist
         bool tsKeepIncompleteSegments = true;  // Keep incomplete segments on crash
 
+        // Video decode mode (0=passthrough, 1=ffmpeg, 2=sdk)
+        int videoDecodeMode = 1;
+
         // Metadata tracking
         std::string taskId = "";   // Task identifier for metadata
         std::string channel = "";  // Channel name for metadata
@@ -107,6 +112,10 @@ class RecordingSink {
                       int32_t yStride, int32_t uStride, int32_t vStride, uint32_t width,
                       uint32_t height, uint64_t timestamp, const std::string& userId = "");
 
+    // Encoded video frame input (passthrough mode — no decode/encode for video)
+    void onEncodedVideoFrame(uint32_t uid, const uint8_t* data, size_t length,
+                             const agora::rtc::EncodedVideoFrameInfo& info);
+
     // Audio frame input
     void onAudioFrame(const uint8_t* audioBuffer, int samples, int sampleRate, int channels,
                       uint64_t timestamp, const std::string& userId = "");
@@ -131,6 +140,28 @@ class RecordingSink {
     std::pair<int, int> calculateOptimalLayout(int numUsers);
 
    private:
+    // Passthrough context per user (encoded video → container without re-encoding)
+    struct PassthroughContext {
+        AVFormatContext* formatContext = nullptr;
+        AVStream* videoStream = nullptr;
+        AVStream* audioStream = nullptr;
+        AVCodecContext* audioCodecContext = nullptr;
+        SwrContext* swrContext = nullptr;
+        AVFrame* audioFrame = nullptr;
+        std::string filename;
+        bool headerWritten = false;
+        bool extraDataSet = false;
+        bool isHevc = false;  // true for H265/HEVC, false for H264
+        int64_t videoFrameCount = 0;
+        int64_t audioFrameCount = 0;
+        uint64_t rtcTimeOrigin = 0;
+        bool hasTimeOrigin = false;
+        int64_t lastVideoPts = -1;
+        int64_t lastAudioPts = -1;
+        std::vector<int16_t> audioSampleBuffer;
+        uint64_t lastBufferedTimestamp = 0;
+    };
+
     // FFmpeg contexts per user (for individual mode)
     struct UserContext {
         AVFormatContext* formatContext = nullptr;
@@ -211,6 +242,16 @@ class RecordingSink {
     bool switchToNewTSSegment(UserContext* context);
     bool detectKeyframe(AVPacket* packet, UserContext* context);
 
+    // Passthrough (encoded frame) methods
+    bool initializePassthroughContext(const std::string& userId, uint32_t width, uint32_t height,
+                                      bool isHevc);
+    bool writePassthroughVideoPacket(PassthroughContext* ctx, const uint8_t* data, size_t length,
+                                     bool isKeyframe, uint64_t timestampMs);
+    bool setupPassthroughExtradata(PassthroughContext* ctx, const uint8_t* data, size_t length);
+    void cleanupPassthroughContext(const std::string& userId);
+    bool encodePassthroughAudioFrame(const AudioFrame& frame, PassthroughContext* ctx,
+                                     const std::string& userId);
+
     // Utilities
     std::string generateOutputFilename(const std::string& userId = "");
     std::string getFileExtension() const;
@@ -236,6 +277,7 @@ class RecordingSink {
     std::condition_variable audioQueueCv_;
 
     std::map<std::string, std::unique_ptr<UserContext>> userContexts_;
+    std::map<std::string, std::unique_ptr<PassthroughContext>> passthroughContexts_;
     std::mutex userContextsMutex_;
 
     // For composite mode

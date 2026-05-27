@@ -16,6 +16,7 @@ struct UDSMessage {
     std::string access_token;        // Access token for authentication
     int workerUid = 0;               // Worker UID
     int interval_in_ms = 0;          // Interval in milliseconds
+    int videoDecodeMode = 1;         // 0=passthrough, 1=ffmpeg(default), 2=sdk
 };
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager
@@ -36,7 +37,8 @@ inline void to_json(nlohmann::json& j, const UDSMessage& m) {
                        {"channel", m.channel},
                        {"access_token", m.access_token},
                        {"workerUid", m.workerUid},
-                       {"interval_in_ms", m.interval_in_ms}};
+                       {"interval_in_ms", m.interval_in_ms},
+                       {"videoDecodeMode", m.videoDecodeMode}};
 }
 
 inline void to_json(nlohmann::json& j, const UDSCompletionMessage& m) {
@@ -58,6 +60,7 @@ inline void from_json(const nlohmann::json& j, UDSMessage& m) {
     j.at("access_token").get_to(m.access_token);
     if (j.contains("workerUid")) j.at("workerUid").get_to(m.workerUid);
     if (j.contains("interval_in_ms")) j.at("interval_in_ms").get_to(m.interval_in_ms);
+    if (j.contains("videoDecodeMode")) j.at("videoDecodeMode").get_to(m.videoDecodeMode);
 }
 
 inline void from_json(const nlohmann::json& j, UDSCompletionMessage& m) {

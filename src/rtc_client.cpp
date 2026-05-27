@@ -118,10 +118,18 @@ bool RtcClient::connect() {
     // Create video subscription options
     agora::rtc::VideoSubscriptionOptions subscriptionOptions;
     subscriptionOptions.type = agora::rtc::VIDEO_STREAM_HIGH;
-    // Subscribe to encoded frames only — we decode them ourselves using ffmpeg.
-    // This prevents the SDK from creating internal decoders which crash (SIGABRT)
-    // when handling multiple simultaneous video streams.
-    subscriptionOptions.encodedFrameOnly = true;
+
+    // Set encodedFrameOnly based on decode mode:
+    // - FfmpegDecode/Passthrough: receive encoded H264 (bypass SDK decoder crash)
+    // - SdkDecode: let SDK decode internally (crash risk with mixed pixel formats)
+    if (config_.videoDecodeMode == VideoDecodeMode::SdkDecode) {
+        subscriptionOptions.encodedFrameOnly = false;
+        AG_LOG(INFO, "Video decode mode: SDK (internal decoder, crash risk with mixed formats)");
+    } else {
+        subscriptionOptions.encodedFrameOnly = true;
+        AG_LOG(INFO, "Video decode mode: %s (encoded frame observer)",
+               config_.videoDecodeMode == VideoDecodeMode::Passthrough ? "Passthrough" : "FFmpeg");
+    }
 
     // Subscribe to remote streams
     if (!config_.remoteUserId.empty()) {
@@ -142,25 +150,55 @@ bool RtcClient::connect() {
         }
     }
 
-    // Create and register encoded frame observer to receive H264 frames directly.
-    // We decode them ourselves using ffmpeg to avoid an SDK bug where its internal
-    // decoder crashes (SIGABRT) when creating multiple H264 decoder instances.
-    if (videoFrameCallback_) {
-        try {
-            encodedFrameObserver_ = std::make_unique<EncodedFrameDecoder>(videoFrameCallback_);
-
-            int ret = connection_->getLocalUser()->registerVideoEncodedFrameObserver(
-                encodedFrameObserver_.get());
-            if (ret != 0) {
-                AG_LOG(ERROR, "Failed to register encoded video frame observer, error: %d", ret);
+    // Register video observer based on decode mode
+    if (config_.videoDecodeMode == VideoDecodeMode::SdkDecode) {
+        // Mode 3: SDK internal decoder → YUV frames via IVideoFrameObserver2
+        // WARNING: Crashes with SIGABRT when multiple users have different pixel formats
+        if (videoFrameCallback_) {
+            frameObserver_ = new YuvFrameObserver(videoFrameCallback_);
+            frameObserver_->AddRef();
+            connection_->getLocalUser()->registerVideoFrameObserver(frameObserver_.get());
+            AG_LOG(INFO, "Registered SDK video frame observer (IVideoFrameObserver2)");
+        }
+    } else if (config_.videoDecodeMode == VideoDecodeMode::Passthrough) {
+        // Mode 1: Forward raw H264 directly without decoding (individual recording only)
+        if (encodedVideoFrameCallback_) {
+            try {
+                encodedFrameForwarder_ =
+                    std::make_unique<EncodedFrameForwarder>(encodedVideoFrameCallback_);
+                int ret = connection_->getLocalUser()->registerVideoEncodedFrameObserver(
+                    encodedFrameForwarder_.get());
+                if (ret != 0) {
+                    AG_LOG(ERROR, "Failed to register encoded frame forwarder, error: %d", ret);
+                    encodedFrameForwarder_.reset();
+                    return false;
+                }
+                AG_LOG(INFO, "Registered encoded frame forwarder (passthrough, no decode)");
+            } catch (const std::exception& e) {
+                AG_LOG(ERROR, "Exception creating encoded frame forwarder: %s", e.what());
+                encodedFrameForwarder_.reset();
+                return false;
+            }
+        }
+    } else {
+        // Mode 2 (default): FFmpeg decode — receive encoded H264, decode ourselves
+        if (videoFrameCallback_) {
+            try {
+                encodedFrameObserver_ = std::make_unique<EncodedFrameDecoder>(videoFrameCallback_);
+                int ret = connection_->getLocalUser()->registerVideoEncodedFrameObserver(
+                    encodedFrameObserver_.get());
+                if (ret != 0) {
+                    AG_LOG(ERROR, "Failed to register encoded video frame observer, error: %d",
+                           ret);
+                    encodedFrameObserver_.reset();
+                    return false;
+                }
+                AG_LOG(INFO, "Registered encoded video frame observer (ffmpeg decode)");
+            } catch (const std::exception& e) {
+                AG_LOG(ERROR, "Exception creating encoded frame observer: %s", e.what());
                 encodedFrameObserver_.reset();
                 return false;
             }
-            AG_LOG(INFO, "Registered encoded video frame observer (bypassing SDK decoder)");
-        } catch (const std::exception& e) {
-            AG_LOG(ERROR, "Exception creating encoded frame observer: %s", e.what());
-            encodedFrameObserver_.reset();
-            return false;
         }
     }
 
@@ -262,6 +300,16 @@ void RtcClient::disconnect() {
                 AG_LOG_TS(ERROR, "Exception unregistering encoded frame observer: %s", e.what());
             }
             encodedFrameObserver_.reset();
+        }
+
+        if (encodedFrameForwarder_ && connection_) {
+            try {
+                connection_->getLocalUser()->unregisterVideoEncodedFrameObserver(
+                    encodedFrameForwarder_.get());
+            } catch (const std::exception& e) {
+                AG_LOG_TS(ERROR, "Exception unregistering encoded frame forwarder: %s", e.what());
+            }
+            encodedFrameForwarder_.reset();
         }
 
         if (frameObserver_ && connection_) {

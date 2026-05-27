@@ -299,6 +299,12 @@ void RecordingSink::stop() {
         }
         userContexts_.clear();
 
+        // Cleanup passthrough contexts
+        for (auto& pair : passthroughContexts_) {
+            cleanupPassthroughContext(pair.first);
+        }
+        passthroughContexts_.clear();
+
         AG_LOG_TS(INFO, "All user contexts cleared");
     }
 
@@ -1080,6 +1086,16 @@ bool RecordingSink::encodeAudioFrame(const AudioFrame& frame, const std::string&
     encode_log_count++;
 
     if (config_.mode == VideoCompositor::Mode::Individual) {
+        // In passthrough mode, route audio to passthrough context (if it exists)
+        if (config_.videoDecodeMode == 0) {
+            auto it = passthroughContexts_.find(userId);
+            if (it != passthroughContexts_.end()) {
+                return encodePassthroughAudioFrame(frame, it->second.get(), userId);
+            }
+            // Passthrough context not yet created (waiting for first video frame) — drop audio
+            return true;
+        }
+
         // Individual mode - encode each user separately
         std::lock_guard<std::mutex> lock(userContextsMutex_);
 
@@ -2392,6 +2408,633 @@ bool RecordingSink::switchToNewTSSegment(UserContext* context) {
     }
 
     AG_LOG_FAST(INFO, "Successfully switched to new TS segment: %s", newSegmentPath.c_str());
+    return true;
+}
+
+// =============================================================================
+// Passthrough (Encoded Frame) Recording — writes H264 directly to container
+// =============================================================================
+
+void RecordingSink::onEncodedVideoFrame(uint32_t uid, const uint8_t* data, size_t length,
+                                        const agora::rtc::EncodedVideoFrameInfo& info) {
+    if (!isRecording() || !data || length == 0) {
+        return;
+    }
+
+    std::string userId = std::to_string(uid);
+
+    if (!shouldRecordUser(userId)) {
+        return;
+    }
+
+    static int encoded_count = 0;
+    encoded_count++;
+    if (encoded_count == 1 || encoded_count % 100 == 0) {
+        AG_LOG_FAST(INFO, "Passthrough: encoded frame #%d uid=%u len=%zu keyframe=%d",
+                    encoded_count, uid, length,
+                    info.frameType == VIDEO_FRAME_TYPE_KEY_FRAME ? 1 : 0);
+    }
+
+    // Support H264 and H265/HEVC for passthrough
+    bool isHevc = false;
+    if (info.codecType == VIDEO_CODEC_H265) {
+        isHevc = true;
+    } else if (info.codecType != VIDEO_CODEC_H264) {
+        static int unsupported_count = 0;
+        if (unsupported_count++ % 100 == 0) {
+            AG_LOG_FAST(WARN, "Passthrough: unsupported codec %d from uid %u", info.codecType, uid);
+        }
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(userContextsMutex_);
+
+    auto it = passthroughContexts_.find(userId);
+    if (it == passthroughContexts_.end()) {
+        if (!initializePassthroughContext(userId, info.width, info.height, isHevc)) {
+            return;
+        }
+        it = passthroughContexts_.find(userId);
+    }
+
+    auto* ctx = it->second.get();
+    bool isKeyframe = (info.frameType == VIDEO_FRAME_TYPE_KEY_FRAME);
+
+    // Use system time for PTS (SDK's captureTimeMs is RTC internal, not epoch)
+    uint64_t timestampMs =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count());
+
+    // On first keyframe, extract SPS/PPS and set up extradata
+    if (!ctx->extraDataSet && isKeyframe) {
+        if (!setupPassthroughExtradata(ctx, data, length)) {
+            AG_LOG_FAST(WARN, "Failed to extract SPS/PPS from keyframe for uid %u", uid);
+            return;
+        }
+    }
+
+    // Don't write non-keyframes before we have extradata
+    if (!ctx->headerWritten) {
+        return;
+    }
+
+    writePassthroughVideoPacket(ctx, data, length, isKeyframe, timestampMs);
+}
+
+bool RecordingSink::initializePassthroughContext(const std::string& userId, uint32_t width,
+                                                 uint32_t height, bool isHevc) {
+    auto ctx = std::make_unique<PassthroughContext>();
+    ctx->isHevc = isHevc;
+    ctx->filename = generateOutputFilename(userId);
+
+    // Create output format context
+    int ret = avformat_alloc_output_context2(&ctx->formatContext, nullptr, nullptr,
+                                             ctx->filename.c_str());
+    if (ret < 0 || !ctx->formatContext) {
+        AG_LOG_FAST(ERROR, "Passthrough: failed to create output context for user %s",
+                    userId.c_str());
+        return false;
+    }
+
+    // Add video stream (codec copy — no encoding)
+    ctx->videoStream = avformat_new_stream(ctx->formatContext, nullptr);
+    if (!ctx->videoStream) {
+        AG_LOG_FAST(ERROR, "Passthrough: failed to create video stream for user %s",
+                    userId.c_str());
+        avformat_free_context(ctx->formatContext);
+        return false;
+    }
+
+    ctx->videoStream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    ctx->videoStream->codecpar->codec_id = isHevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+    ctx->videoStream->codecpar->width = width > 0 ? width : config_.videoWidth;
+    ctx->videoStream->codecpar->height = height > 0 ? height : config_.videoHeight;
+    ctx->videoStream->time_base = {1, 90000};
+
+    // Add audio stream if audio recording is enabled
+    if (config_.recordAudio) {
+        if (!setupAudioEncoder(&ctx->audioCodecContext, userId)) {
+            AG_LOG_FAST(WARN, "Passthrough: failed to set up audio encoder for user %s",
+                        userId.c_str());
+        } else {
+            ctx->audioStream = avformat_new_stream(ctx->formatContext, nullptr);
+            if (ctx->audioStream) {
+                avcodec_parameters_from_context(ctx->audioStream->codecpar, ctx->audioCodecContext);
+                ctx->audioStream->time_base = ctx->audioCodecContext->time_base;
+
+                // Allocate audio frame
+                ctx->audioFrame = av_frame_alloc();
+                if (ctx->audioFrame) {
+                    ctx->audioFrame->format = ctx->audioCodecContext->sample_fmt;
+                    ctx->audioFrame->ch_layout = ctx->audioCodecContext->ch_layout;
+                    ctx->audioFrame->sample_rate = ctx->audioCodecContext->sample_rate;
+                    ctx->audioFrame->nb_samples = ctx->audioCodecContext->frame_size;
+                    av_frame_get_buffer(ctx->audioFrame, 0);
+                }
+            }
+        }
+    }
+
+    AG_LOG_FAST(INFO, "Passthrough: created context for user %s → %s (%ux%u)", userId.c_str(),
+                ctx->filename.c_str(), ctx->videoStream->codecpar->width,
+                ctx->videoStream->codecpar->height);
+
+    passthroughContexts_[userId] = std::move(ctx);
+    return true;
+}
+
+// Helper: scan Annex-B bitstream and collect NAL units by type
+static std::vector<std::pair<int, std::vector<uint8_t>>> parseAnnexBNalUnits(const uint8_t* data,
+                                                                             size_t length,
+                                                                             bool isHevc) {
+    std::vector<std::pair<int, std::vector<uint8_t>>> nalus;  // {nalType, nalData}
+    size_t i = 0;
+
+    while (i < length - 3) {
+        int startCodeLen = 0;
+        if (i + 3 < length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
+            data[i + 3] == 1) {
+            startCodeLen = 4;
+        } else if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            startCodeLen = 3;
+        }
+        if (startCodeLen == 0) {
+            i++;
+            continue;
+        }
+
+        size_t nalStart = i + startCodeLen;
+        if (nalStart >= length) break;
+
+        int nalType = isHevc ? ((data[nalStart] >> 1) & 0x3F) : (data[nalStart] & 0x1F);
+
+        size_t nalEnd = length;
+        for (size_t j = nalStart + 1; j < length - 2; j++) {
+            if (data[j] == 0 && data[j + 1] == 0 &&
+                (data[j + 2] == 1 || (j + 3 < length && data[j + 2] == 0 && data[j + 3] == 1))) {
+                nalEnd = j;
+                break;
+            }
+        }
+
+        // Remove trailing zeros
+        while (nalEnd > nalStart && data[nalEnd - 1] == 0) nalEnd--;
+
+        nalus.push_back({nalType, std::vector<uint8_t>(data + nalStart, data + nalEnd)});
+        i = nalEnd;
+    }
+    return nalus;
+}
+
+// Helper: append a NALU array entry for HEVCDecoderConfigurationRecord
+static void appendHevcNaluArray(std::vector<uint8_t>& out, uint8_t naluType,
+                                const std::vector<uint8_t>& nalu) {
+    out.push_back(0x80 | naluType);  // array_completeness=1 | NAL_unit_type
+    out.push_back(0);
+    out.push_back(1);  // numNalus = 1
+    out.push_back((nalu.size() >> 8) & 0xFF);
+    out.push_back(nalu.size() & 0xFF);
+    out.insert(out.end(), nalu.begin(), nalu.end());
+}
+
+// Extract parameter sets from an Annex-B keyframe and build codec-specific extradata
+bool RecordingSink::setupPassthroughExtradata(PassthroughContext* ctx, const uint8_t* data,
+                                              size_t length) {
+    auto nalus = parseAnnexBNalUnits(data, length, ctx->isHevc);
+    std::vector<uint8_t> extradata;
+
+    if (ctx->isHevc) {
+        // HEVC: find VPS (32), SPS (33), PPS (34)
+        std::vector<uint8_t> vps, sps, pps;
+        for (auto& [type, nalu] : nalus) {
+            if (type == 32 && vps.empty())
+                vps = nalu;
+            else if (type == 33 && sps.empty())
+                sps = nalu;
+            else if (type == 34 && pps.empty())
+                pps = nalu;
+        }
+        if (sps.empty() || pps.empty()) {
+            AG_LOG_FAST(WARN, "Passthrough HEVC: could not find SPS/PPS in keyframe (%zu bytes)",
+                        length);
+            return false;
+        }
+
+        // Build HEVCDecoderConfigurationRecord (ISO 14496-15 Section 8.3.3.1)
+        // Parse profile/level from SPS NAL (skip 2-byte NALU header)
+        uint8_t generalProfileSpace = 0, generalTierFlag = 0, generalProfileIdc = 0;
+        uint8_t generalLevelIdc = 0;
+        uint32_t generalProfileCompatFlags = 0;
+        uint8_t generalConstraintFlags[6] = {0};
+        if (sps.size() > 15) {
+            // SPS starts after 2-byte NALU header: profile_tier_level begins at byte 2
+            generalProfileSpace = (sps[2] >> 6) & 0x03;
+            generalTierFlag = (sps[2] >> 5) & 0x01;
+            generalProfileIdc = sps[2] & 0x1F;
+            generalProfileCompatFlags = (sps[3] << 24) | (sps[4] << 16) | (sps[5] << 8) | sps[6];
+            for (int k = 0; k < 6; k++) generalConstraintFlags[k] = sps[7 + k];
+            generalLevelIdc = sps[13];
+        }
+
+        // configurationVersion = 1
+        extradata.push_back(1);
+        // general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
+        extradata.push_back((generalProfileSpace << 6) | (generalTierFlag << 5) |
+                            generalProfileIdc);
+        // general_profile_compatibility_flags (4 bytes)
+        extradata.push_back((generalProfileCompatFlags >> 24) & 0xFF);
+        extradata.push_back((generalProfileCompatFlags >> 16) & 0xFF);
+        extradata.push_back((generalProfileCompatFlags >> 8) & 0xFF);
+        extradata.push_back(generalProfileCompatFlags & 0xFF);
+        // general_constraint_indicator_flags (6 bytes)
+        for (int k = 0; k < 6; k++) extradata.push_back(generalConstraintFlags[k]);
+        // general_level_idc
+        extradata.push_back(generalLevelIdc);
+        // min_spatial_segmentation_idc (4 bits reserved + 12 bits)
+        extradata.push_back(0xF0);
+        extradata.push_back(0x00);
+        // parallelismType (6 bits reserved + 2 bits)
+        extradata.push_back(0xFC);
+        // chromaFormat (6 bits reserved + 2 bits) — assume 1 (4:2:0)
+        extradata.push_back(0xFD);
+        // bitDepthLumaMinus8 (5 bits reserved + 3 bits) — assume 2 for 10-bit
+        extradata.push_back(0xFA);
+        // bitDepthChromaMinus8 (5 bits reserved + 3 bits)
+        extradata.push_back(0xFA);
+        // avgFrameRate (0 = unspecified)
+        extradata.push_back(0x00);
+        extradata.push_back(0x00);
+        // constantFrameRate(2) | numTemporalLayers(3) | temporalIdNested(1) |
+        // lengthSizeMinusOne(2)
+        extradata.push_back(0x03);  // lengthSizeMinusOne=3 (4-byte)
+        // numOfArrays
+        int numArrays = vps.empty() ? 2 : 3;
+        extradata.push_back(numArrays);
+
+        // NAL arrays: VPS, SPS, PPS
+        if (!vps.empty()) appendHevcNaluArray(extradata, 32, vps);
+        appendHevcNaluArray(extradata, 33, sps);
+        appendHevcNaluArray(extradata, 34, pps);
+
+        AG_LOG_FAST(INFO,
+                    "Passthrough HEVC: extradata built (%zu bytes, VPS=%zu SPS=%zu PPS=%zu, "
+                    "profile=%d level=%d)",
+                    extradata.size(), vps.size(), sps.size(), pps.size(), generalProfileIdc,
+                    generalLevelIdc);
+
+    } else {
+        // H264: find SPS (7) and PPS (8)
+        std::vector<uint8_t> sps, pps;
+        for (auto& [type, nalu] : nalus) {
+            if (type == 7 && sps.empty())
+                sps = nalu;
+            else if (type == 8 && pps.empty())
+                pps = nalu;
+        }
+        if (sps.empty() || pps.empty()) {
+            AG_LOG_FAST(WARN, "Passthrough H264: could not find SPS/PPS in keyframe (%zu bytes)",
+                        length);
+            return false;
+        }
+
+        // Build AVCDecoderConfigurationRecord
+        extradata.push_back(1);       // configurationVersion
+        extradata.push_back(sps[1]);  // AVCProfileIndication
+        extradata.push_back(sps[2]);  // profile_compatibility
+        extradata.push_back(sps[3]);  // AVCLevelIndication
+        extradata.push_back(0xFF);    // lengthSizeMinusOne = 3 (4-byte NAL length)
+        extradata.push_back(0xE1);    // numOfSequenceParameterSets = 1
+        extradata.push_back((sps.size() >> 8) & 0xFF);
+        extradata.push_back(sps.size() & 0xFF);
+        extradata.insert(extradata.end(), sps.begin(), sps.end());
+        extradata.push_back(1);  // numOfPictureParameterSets = 1
+        extradata.push_back((pps.size() >> 8) & 0xFF);
+        extradata.push_back(pps.size() & 0xFF);
+        extradata.insert(extradata.end(), pps.begin(), pps.end());
+
+        AG_LOG_FAST(INFO, "Passthrough H264: extradata built (%zu bytes, SPS=%zu PPS=%zu)",
+                    extradata.size(), sps.size(), pps.size());
+    }
+
+    // Set extradata on codec parameters
+    ctx->videoStream->codecpar->extradata =
+        (uint8_t*)av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+    memcpy(ctx->videoStream->codecpar->extradata, extradata.data(), extradata.size());
+    ctx->videoStream->codecpar->extradata_size = extradata.size();
+
+    ctx->extraDataSet = true;
+
+    // Now open output file and write header
+    if (!(ctx->formatContext->oformat->flags & AVFMT_NOFILE)) {
+        int ret = avio_open(&ctx->formatContext->pb, ctx->filename.c_str(), AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            AG_LOG_FAST(ERROR, "Passthrough: failed to open output file %s", ctx->filename.c_str());
+            return false;
+        }
+    }
+
+    AVDictionary* opts = nullptr;
+    // For MP4, enable faststart for better streaming compatibility
+    if (config_.format == OutputFormat::MP4) {
+        av_dict_set(&opts, "movflags", "faststart", 0);
+    }
+
+    int ret = avformat_write_header(ctx->formatContext, opts ? &opts : nullptr);
+    if (opts) av_dict_free(&opts);
+
+    if (ret < 0) {
+        AG_LOG_FAST(ERROR, "Passthrough: failed to write header for %s (error %d)",
+                    ctx->filename.c_str(), ret);
+        return false;
+    }
+
+    ctx->headerWritten = true;
+    AG_LOG_FAST(INFO, "Passthrough: header written for %s (%s, extradata %d bytes)",
+                ctx->filename.c_str(), ctx->isHevc ? "HEVC" : "H264",
+                ctx->videoStream->codecpar->extradata_size);
+    return true;
+}
+
+// Convert Annex-B (start codes) to length-prefixed format for MP4 container
+// Skips parameter set NALUs (H264: SPS=7/PPS=8, HEVC: VPS=32/SPS=33/PPS=34)
+static std::vector<uint8_t> annexBToAvcc(const uint8_t* data, size_t length, bool isHevc) {
+    std::vector<uint8_t> avcc;
+    avcc.reserve(length);
+    size_t i = 0;
+
+    while (i < length) {
+        int startCodeLen = 0;
+        if (i + 3 < length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
+            data[i + 3] == 1) {
+            startCodeLen = 4;
+        } else if (i + 2 < length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            startCodeLen = 3;
+        }
+
+        if (startCodeLen == 0) {
+            i++;
+            continue;
+        }
+
+        size_t nalStart = i + startCodeLen;
+        if (nalStart >= length) break;
+
+        size_t nalEnd = length;
+        for (size_t j = nalStart; j < length - 2; j++) {
+            if (data[j] == 0 && data[j + 1] == 0 &&
+                (data[j + 2] == 1 || (j + 3 < length && data[j + 2] == 0 && data[j + 3] == 1))) {
+                nalEnd = j;
+                break;
+            }
+        }
+
+        // Get NAL type and skip parameter sets (already in extradata)
+        int nalType = isHevc ? ((data[nalStart] >> 1) & 0x3F) : (data[nalStart] & 0x1F);
+        bool isParamSet = isHevc ? (nalType >= 32 && nalType <= 34)  // VPS, SPS, PPS
+                                 : (nalType == 7 || nalType == 8);   // SPS, PPS
+
+        if (!isParamSet) {
+            uint32_t nalLen = static_cast<uint32_t>(nalEnd - nalStart);
+            avcc.push_back((nalLen >> 24) & 0xFF);
+            avcc.push_back((nalLen >> 16) & 0xFF);
+            avcc.push_back((nalLen >> 8) & 0xFF);
+            avcc.push_back(nalLen & 0xFF);
+            avcc.insert(avcc.end(), data + nalStart, data + nalEnd);
+        }
+
+        i = nalEnd;
+    }
+
+    return avcc;
+}
+
+bool RecordingSink::writePassthroughVideoPacket(PassthroughContext* ctx, const uint8_t* data,
+                                                size_t length, bool isKeyframe,
+                                                uint64_t timestampMs) {
+    // Initialize time origin
+    if (!ctx->hasTimeOrigin) {
+        ctx->rtcTimeOrigin = timestampMs;
+        ctx->hasTimeOrigin = true;
+    }
+
+    // Calculate PTS in stream time base (90kHz)
+    int64_t relativeMs = static_cast<int64_t>(timestampMs - ctx->rtcTimeOrigin);
+    int64_t pts = av_rescale_q(relativeMs, {1, 1000}, ctx->videoStream->time_base);
+
+    // Ensure monotonic PTS
+    if (pts <= ctx->lastVideoPts) {
+        pts = ctx->lastVideoPts + 1;
+    }
+    ctx->lastVideoPts = pts;
+
+    // Convert Annex-B → AVCC (MP4 requires length-prefixed NALUs, not start codes)
+    std::vector<uint8_t> avccData = annexBToAvcc(data, length, ctx->isHevc);
+    if (avccData.empty()) {
+        return false;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return false;
+
+    pkt->data = avccData.data();
+    pkt->size = static_cast<int>(avccData.size());
+    pkt->stream_index = ctx->videoStream->index;
+    pkt->pts = pts;
+    pkt->dts = pts;
+    if (isKeyframe) {
+        pkt->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    int ret = av_interleaved_write_frame(ctx->formatContext, pkt);
+    av_packet_free(&pkt);
+
+    if (ret < 0) {
+        static int write_err_count = 0;
+        if (write_err_count++ % 100 == 0) {
+            AG_LOG_FAST(WARN, "Passthrough: write frame failed (error %d, count %d)", ret,
+                        write_err_count);
+        }
+        return false;
+    }
+
+    ctx->videoFrameCount++;
+    if (ctx->videoFrameCount % 100 == 0) {
+        AG_LOG_FAST(INFO, "Passthrough: %lld video frames written for %s",
+                    (long long)ctx->videoFrameCount, ctx->filename.c_str());
+    }
+    return true;
+}
+
+void RecordingSink::cleanupPassthroughContext(const std::string& userId) {
+    auto it = passthroughContexts_.find(userId);
+    if (it == passthroughContexts_.end()) return;
+
+    auto* ctx = it->second.get();
+
+    if (ctx->formatContext) {
+        if (ctx->headerWritten) {
+            av_write_trailer(ctx->formatContext);
+            AG_LOG_FAST(INFO, "Passthrough: finalized %s (%lld video frames)",
+                        ctx->filename.c_str(), (long long)ctx->videoFrameCount);
+        }
+        if (ctx->formatContext->pb && !(ctx->formatContext->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&ctx->formatContext->pb);
+        }
+        avformat_free_context(ctx->formatContext);
+        ctx->formatContext = nullptr;
+    }
+
+    if (ctx->audioCodecContext) {
+        avcodec_free_context(&ctx->audioCodecContext);
+    }
+    if (ctx->audioFrame) {
+        av_frame_free(&ctx->audioFrame);
+    }
+    if (ctx->swrContext) {
+        swr_free(&ctx->swrContext);
+    }
+}
+
+bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, PassthroughContext* ctx,
+                                                const std::string& userId) {
+    if (!ctx || !ctx->audioCodecContext || !ctx->audioFrame || !ctx->headerWritten) {
+        return false;  // Can't write audio until header is written (needs SPS/PPS first)
+    }
+
+    // Resampling setup (same logic as encodeIndividualAudioFrame)
+    bool needsResampling =
+        (frame.sampleRate != config_.audioSampleRate || frame.channels != config_.audioChannels);
+
+    if (needsResampling && !ctx->swrContext) {
+        AVChannelLayout in_ch_layout, out_ch_layout;
+        av_channel_layout_default(&in_ch_layout, frame.channels);
+        av_channel_layout_default(&out_ch_layout, config_.audioChannels);
+
+        int ret = swr_alloc_set_opts2(&ctx->swrContext, &out_ch_layout, AV_SAMPLE_FMT_FLTP,
+                                      config_.audioSampleRate, &in_ch_layout, AV_SAMPLE_FMT_S16,
+                                      frame.sampleRate, 0, nullptr);
+        if (ret < 0 || !ctx->swrContext) {
+            AG_LOG_FAST(ERROR, "Passthrough: failed to allocate audio resampler for user %s",
+                        userId.c_str());
+            return false;
+        }
+        ret = swr_init(ctx->swrContext);
+        if (ret < 0) {
+            swr_free(&ctx->swrContext);
+            return false;
+        }
+    }
+
+    // Buffer incoming samples
+    int input_samples = frame.data.size() / sizeof(int16_t) / frame.channels;
+    const int16_t* input_data = reinterpret_cast<const int16_t*>(frame.data.data());
+
+    int samples_per_frame = ctx->audioCodecContext->frame_size;
+    if (samples_per_frame == 0) samples_per_frame = 1024;
+
+    size_t current_size = ctx->audioSampleBuffer.size();
+    size_t new_count = input_samples * frame.channels;
+    ctx->audioSampleBuffer.resize(current_size + new_count);
+    std::memcpy(ctx->audioSampleBuffer.data() + current_size, input_data,
+                new_count * sizeof(int16_t));
+    ctx->lastBufferedTimestamp = frame.timestamp;
+
+    size_t required = samples_per_frame * frame.channels;
+    if (ctx->audioSampleBuffer.size() < required) {
+        return true;  // Buffering
+    }
+
+    // Initialize time origin if needed
+    if (!ctx->hasTimeOrigin) {
+        ctx->rtcTimeOrigin = frame.timestamp;
+        ctx->hasTimeOrigin = true;
+    }
+
+    // Calculate PTS in 90kHz timebase
+    uint64_t elapsed_ms = frame.timestamp - ctx->rtcTimeOrigin;
+    int64_t pts = static_cast<int64_t>(elapsed_ms) * 90;  // ms → 90kHz
+
+    // Set up audio frame
+    ctx->audioFrame->nb_samples = samples_per_frame;
+    ctx->audioFrame->format = ctx->audioCodecContext->sample_fmt;
+    ctx->audioFrame->sample_rate = ctx->audioCodecContext->sample_rate;
+    av_channel_layout_copy(&ctx->audioFrame->ch_layout, &ctx->audioCodecContext->ch_layout);
+    ctx->audioFrame->pts = av_rescale_q(pts, {1, 90000}, ctx->audioCodecContext->time_base);
+
+    if (av_frame_get_buffer(ctx->audioFrame, 0) < 0) {
+        return false;
+    }
+
+    // Convert samples to planar float
+    if (needsResampling && ctx->swrContext) {
+        const uint8_t* input_arr[1] = {
+            reinterpret_cast<const uint8_t*>(ctx->audioSampleBuffer.data())};
+        int in_count = samples_per_frame * frame.channels / config_.audioChannels;
+        int out = swr_convert(ctx->swrContext, ctx->audioFrame->data, samples_per_frame, input_arr,
+                              in_count);
+        if (out < 0) return false;
+        ctx->audioFrame->nb_samples = out;
+    } else if (ctx->audioCodecContext->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+        const int16_t* buf = ctx->audioSampleBuffer.data();
+        for (int ch = 0; ch < config_.audioChannels; ch++) {
+            float* out = (float*)ctx->audioFrame->data[ch];
+            for (int i = 0; i < samples_per_frame; i++) {
+                int src_ch = (frame.channels == 1) ? 0 : std::min(ch, frame.channels - 1);
+                out[i] = static_cast<float>(buf[i * frame.channels + src_ch]) / 32768.0f;
+            }
+        }
+        ctx->audioFrame->nb_samples = samples_per_frame;
+    }
+
+    // Consume processed samples
+    size_t consumed = samples_per_frame * frame.channels;
+    if (ctx->audioSampleBuffer.size() > consumed) {
+        std::memmove(ctx->audioSampleBuffer.data(), ctx->audioSampleBuffer.data() + consumed,
+                     (ctx->audioSampleBuffer.size() - consumed) * sizeof(int16_t));
+        ctx->audioSampleBuffer.resize(ctx->audioSampleBuffer.size() - consumed);
+    } else {
+        ctx->audioSampleBuffer.clear();
+    }
+
+    ctx->audioFrameCount++;
+
+    // Encode and write
+    AVPacket* packet = av_packet_alloc();
+    if (!packet) return false;
+
+    int ret = avcodec_send_frame(ctx->audioCodecContext, ctx->audioFrame);
+    if (ret < 0) {
+        av_packet_free(&packet);
+        return false;
+    }
+
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(ctx->audioCodecContext, packet);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0) {
+            av_packet_free(&packet);
+            return false;
+        }
+
+        packet->stream_index = ctx->audioStream->index;
+        if (packet->pts != AV_NOPTS_VALUE) {
+            packet->pts = av_rescale_q(packet->pts, ctx->audioCodecContext->time_base,
+                                       ctx->audioStream->time_base);
+        }
+        packet->dts = packet->pts;
+
+        int write_ret = av_interleaved_write_frame(ctx->formatContext, packet);
+        if (write_ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, write_ret);
+            AG_LOG_FAST(ERROR, "Passthrough: failed to write audio for %s: %s", userId.c_str(),
+                        errbuf);
+        }
+        av_packet_unref(packet);
+    }
+
+    av_packet_free(&packet);
     return true;
 }
 

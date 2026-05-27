@@ -201,6 +201,77 @@ func TestBuildUDSMessageFromQueueTaskDefaultInterval(t *testing.T) {
 	}
 }
 
+func TestBuildUDSMessageVideoDecodeMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  map[string]interface{}
+		expected int
+	}{
+		{
+			name: "explicit ffmpeg",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(1),
+			},
+			expected: 1,
+		},
+		{
+			name: "explicit passthrough",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(0),
+			},
+			expected: 0,
+		},
+		{
+			name: "explicit sdk",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(2),
+			},
+			expected: 2,
+		},
+		{
+			name: "default for record start",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			},
+			expected: 1, // default to ffmpeg
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &queue.Task{
+				ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+				Payload: tt.payload,
+			}
+			msg, err := buildUDSMessageFromQueueTask(task)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if msg.VideoDecodeMode != tt.expected {
+				t.Fatalf("expected videoDecodeMode %d, got %d", tt.expected, msg.VideoDecodeMode)
+			}
+		})
+	}
+}
+
+func TestValidateUDSMessage_InvalidVideoDecodeMode(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "start", Layout: "flat",
+		Channel: "demo", AccessToken: "token-123456", WorkerUid: 42,
+		VideoDecodeMode: 5,
+	}
+	err := ValidateUDSMessage(msg)
+	if err == nil {
+		t.Fatal("expected error for invalid videoDecodeMode")
+	}
+	if !strings.Contains(err.Error(), "videoDecodeMode") {
+		t.Fatalf("expected error about videoDecodeMode, got: %v", err)
+	}
+}
+
 func TestBuildUDSMessageFromQueueTaskNilTask(t *testing.T) {
 	_, err := buildUDSMessageFromQueueTask(nil)
 	if err == nil {

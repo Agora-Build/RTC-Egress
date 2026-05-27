@@ -102,6 +102,16 @@ void TaskPipe::start(agora::rtc::RtcClient& rtc_client, agora::rtc::SnapshotSink
             this->handleSdkError(errorType, errorMessage);
         });
 
+    // Setup encoded video frame callback for passthrough mode
+    rtc_client_->setEncodedVideoFrameCallback(
+        [this](uint32_t uid, const uint8_t* data, size_t length,
+               const agora::rtc::EncodedVideoFrameInfo& info) {
+            bool has_active_recording = hasActiveTasksOfType("record");
+            if (has_active_recording && recording_sink_) {
+                recording_sink_->onEncodedVideoFrame(uid, data, length, info);
+            }
+        });
+
     // Setup frame callbacks
     rtc_client_->setVideoFrameCallback([this](const agora::media::base::VideoFrame& frame,
                                               const std::string& userId) {
@@ -327,6 +337,44 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
         // Update configs with channel and task information
         recording_config_.channel = msg.channel;
         recording_config_.taskId = msg.task_id;
+
+        // Set recording mode and target users from API request
+        recording_config_.targetUsers = msg.uid;
+        if (msg.uid.size() == 1) {
+            recording_config_.mode = agora::rtc::VideoCompositor::Mode::Individual;
+            logInfo("Individual recording mode (single user: " + msg.uid[0] + ")", instance_id_);
+        } else {
+            recording_config_.mode = agora::rtc::VideoCompositor::Mode::Composite;
+            logInfo("Composite recording mode (" + std::to_string(msg.uid.size()) + " users)",
+                    instance_id_);
+        }
+
+        // Apply video decode mode from API request
+        agora::rtc::VideoDecodeMode decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+        if (msg.videoDecodeMode == 0) {
+            decodeMode = agora::rtc::VideoDecodeMode::Passthrough;
+        } else if (msg.videoDecodeMode == 2) {
+            decodeMode = agora::rtc::VideoDecodeMode::SdkDecode;
+        }
+
+        // Passthrough only works with individual mode (single user or empty = all individual)
+        bool isComposite = (msg.uid.size() != 1);
+        if (decodeMode == agora::rtc::VideoDecodeMode::Passthrough && isComposite) {
+            logInfo("Passthrough not supported with composite mode, falling back to ffmpeg",
+                    instance_id_);
+            decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+        }
+
+        // Set decode mode on RTC client config and recording sink config
+        rtc_client_->config().videoDecodeMode = decodeMode;
+        recording_config_.videoDecodeMode = msg.videoDecodeMode;
+        logInfo(
+            "Video decode mode: " + std::to_string(msg.videoDecodeMode) + " (" +
+                (decodeMode == agora::rtc::VideoDecodeMode::Passthrough
+                     ? "passthrough"
+                     : (decodeMode == agora::rtc::VideoDecodeMode::SdkDecode ? "sdk" : "ffmpeg")) +
+                ")",
+            instance_id_);
 
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = channel_states_[msg.channel];

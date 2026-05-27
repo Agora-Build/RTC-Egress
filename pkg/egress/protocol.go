@@ -21,6 +21,7 @@ type UDSMessage struct {
 	AccessToken        string   `json:"access_token"`       // Access token for authentication
 	WorkerUid          int      `json:"workerUid"`          // Worker UID
 	IntervalInMs       int      `json:"interval_in_ms"`     // Interval in milliseconds
+	VideoDecodeMode    int      `json:"videoDecodeMode"`    // 0=passthrough, 1=ffmpeg(default), 2=sdk
 }
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager
@@ -140,6 +141,24 @@ func buildUDSMessageFromQueueTask(task *queue.Task) (*UDSMessage, error) {
 		udsMsg.IntervalInMs = 20000
 	}
 
+	// VideoDecodeMode (optional, defaults to 1=ffmpeg)
+	if decodeModeVal, ok := payload["videoDecodeMode"]; ok {
+		switch v := decodeModeVal.(type) {
+		case float64:
+			udsMsg.VideoDecodeMode = int(v)
+		case int:
+			udsMsg.VideoDecodeMode = v
+		case int64:
+			udsMsg.VideoDecodeMode = int(v)
+		}
+	}
+	if udsMsg.VideoDecodeMode == 0 && task.Action == "start" && task.Cmd == "record" {
+		// Default to ffmpeg for recording tasks (passthrough=0 must be explicitly set)
+		if _, ok := payload["videoDecodeMode"]; !ok {
+			udsMsg.VideoDecodeMode = 1
+		}
+	}
+
 	// TaskID override for stop/status payloads
 	if taskIDVal, ok := payload["task_id"]; ok {
 		if taskIDStr, isStr := taskIDVal.(string); isStr && taskIDStr != "" {
@@ -207,6 +226,11 @@ func ValidateUDSMessage(msg *UDSMessage) error {
 		}
 	}
 	// Stop and status actions don't require these fields - they use task_id for identification
+
+	// Validate videoDecodeMode (0=passthrough, 1=ffmpeg, 2=sdk)
+	if msg.VideoDecodeMode < 0 || msg.VideoDecodeMode > 2 {
+		return fmt.Errorf("videoDecodeMode must be 0 (passthrough), 1 (ffmpeg), or 2 (sdk)")
+	}
 
 	return nil
 }
