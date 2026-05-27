@@ -16,7 +16,7 @@ struct UDSMessage {
     std::string access_token;        // Access token for authentication
     int workerUid = 0;               // Worker UID
     int interval_in_ms = 0;          // Interval in milliseconds
-    int videoDecodeMode = 1;         // 0=passthrough, 1=ffmpeg(default), 2=sdk
+    int videoDecodeMode = -1;        // -1=auto, 0=passthrough, 1=ffmpeg, 2=sdk
 };
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager

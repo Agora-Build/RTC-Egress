@@ -232,11 +232,11 @@ func TestBuildUDSMessageVideoDecodeMode(t *testing.T) {
 			expected: 2,
 		},
 		{
-			name: "default for record start",
+			name: "default is auto",
 			payload: map[string]interface{}{
 				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
 			},
-			expected: 1, // default to ffmpeg
+			expected: -1, // default to auto (C++ decides based on user count)
 		},
 	}
 

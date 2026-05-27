@@ -441,9 +441,12 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Read video decode mode from config: 0=passthrough, 1=ffmpeg(default), 2=sdk
+            // Read video decode mode from config: 0=passthrough, 1=ffmpeg, 2=sdk
+            // If not specified, auto-detect: single user → passthrough, multi → ffmpeg
+            bool hasExplicitDecodeMode = false;
             if (recording_node["video"] && recording_node["video"]["decode_mode"]) {
                 int mode = recording_node["video"]["decode_mode"].as<int>();
+                hasExplicitDecodeMode = true;
                 if (mode == 0) {
                     rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::Passthrough;
                 } else if (mode == 2) {
@@ -478,6 +481,17 @@ int main(int argc, char* argv[]) {
 
             // Set target users for recording
             recording_config.targetUsers = userList;
+
+            // Auto-detect decode mode if not explicitly set
+            if (!hasExplicitDecodeMode) {
+                if (userList.size() == 1) {
+                    rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::Passthrough;
+                    AG_LOG_FAST(INFO, "[Config] Auto decode mode: passthrough (single user)");
+                } else {
+                    rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+                    AG_LOG_FAST(INFO, "[Config] Auto decode mode: ffmpeg (multiple users)");
+                }
+            }
 
             // Validate: passthrough only works with individual mode
             if (rtc_config.videoDecodeMode == agora::rtc::VideoDecodeMode::Passthrough &&

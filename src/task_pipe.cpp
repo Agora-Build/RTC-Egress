@@ -349,27 +349,36 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
                     instance_id_);
         }
 
-        // Apply video decode mode from API request
+        // Determine video decode mode
+        // -1 = auto: single user → passthrough, multiple users → ffmpeg
+        bool isIndividual = (msg.uid.size() == 1);
+        int resolvedMode = msg.videoDecodeMode;
+        if (resolvedMode == -1) {
+            resolvedMode = isIndividual ? 0 : 1;  // auto: passthrough for single, ffmpeg for multi
+            logInfo("Auto decode mode: " + std::string(isIndividual ? "passthrough" : "ffmpeg"),
+                    instance_id_);
+        }
+
         agora::rtc::VideoDecodeMode decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
-        if (msg.videoDecodeMode == 0) {
+        if (resolvedMode == 0) {
             decodeMode = agora::rtc::VideoDecodeMode::Passthrough;
-        } else if (msg.videoDecodeMode == 2) {
+        } else if (resolvedMode == 2) {
             decodeMode = agora::rtc::VideoDecodeMode::SdkDecode;
         }
 
-        // Passthrough only works with individual mode (single user or empty = all individual)
-        bool isComposite = (msg.uid.size() != 1);
-        if (decodeMode == agora::rtc::VideoDecodeMode::Passthrough && isComposite) {
+        // Passthrough only works with individual mode
+        if (decodeMode == agora::rtc::VideoDecodeMode::Passthrough && !isIndividual) {
             logInfo("Passthrough not supported with composite mode, falling back to ffmpeg",
                     instance_id_);
             decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+            resolvedMode = 1;
         }
 
         // Set decode mode on RTC client config and recording sink config
         rtc_client_->config().videoDecodeMode = decodeMode;
-        recording_config_.videoDecodeMode = msg.videoDecodeMode;
+        recording_config_.videoDecodeMode = resolvedMode;
         logInfo(
-            "Video decode mode: " + std::to_string(msg.videoDecodeMode) + " (" +
+            "Video decode mode: " + std::to_string(resolvedMode) + " (" +
                 (decodeMode == agora::rtc::VideoDecodeMode::Passthrough
                      ? "passthrough"
                      : (decodeMode == agora::rtc::VideoDecodeMode::SdkDecode ? "sdk" : "ffmpeg")) +

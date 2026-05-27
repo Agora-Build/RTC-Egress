@@ -737,9 +737,66 @@ bool RecordingSink::setupOutputFormat(AVFormatContext** formatContext,
 
 bool RecordingSink::setupVideoEncoder(AVCodecContext** videoCodecContext,
                                       const std::string& userId) {
-    const AVCodec* codec = avcodec_find_encoder_by_name(config_.videoCodec.c_str());
+    // Try hardware-accelerated encoders first, then fall back to software
+    struct EncoderCandidate {
+        const char* name;
+        AVPixelFormat pixFmt;
+        bool isHwAccel;
+    };
+
+    std::vector<EncoderCandidate> candidates;
+
+    if (config_.videoCodec == "libx264" || config_.videoCodec == "h264") {
+        candidates = {
+            {"h264_nvenc", AV_PIX_FMT_YUV420P, true},  // NVIDIA GPU
+            {"h264_vaapi", AV_PIX_FMT_VAAPI, true},    // Intel/AMD VA-API
+            {"h264_qsv", AV_PIX_FMT_NV12, true},       // Intel Quick Sync
+            {"libx264", AV_PIX_FMT_YUV420P, false},    // Software fallback
+        };
+    } else {
+        // Non-H264 codec: use as-is without hwaccel probing
+        candidates = {{config_.videoCodec.c_str(), AV_PIX_FMT_YUV420P, false}};
+    }
+
+    const AVCodec* codec = nullptr;
+    AVPixelFormat selectedPixFmt = AV_PIX_FMT_YUV420P;
+    bool usingHwAccel = false;
+
+    for (const auto& candidate : candidates) {
+        codec = avcodec_find_encoder_by_name(candidate.name);
+        if (!codec) continue;
+
+        // For hardware encoders, do a quick open test to verify the device is available
+        if (candidate.isHwAccel) {
+            AVCodecContext* testCtx = avcodec_alloc_context3(codec);
+            if (!testCtx) continue;
+            testCtx->width = config_.videoWidth;
+            testCtx->height = config_.videoHeight;
+            testCtx->time_base = {1, 90000};
+            testCtx->pix_fmt = candidate.pixFmt;
+            testCtx->bit_rate = config_.videoBitrate;
+
+            AVDictionary* testOpts = nullptr;
+            av_dict_set(&testOpts, "preset", "fast", 0);
+            int ret = avcodec_open2(testCtx, codec, &testOpts);
+            av_dict_free(&testOpts);
+            avcodec_free_context(&testCtx);
+
+            if (ret < 0) {
+                AG_LOG_FAST(INFO, "HW encoder %s not available, trying next", candidate.name);
+                continue;
+            }
+        }
+
+        selectedPixFmt = candidate.pixFmt;
+        usingHwAccel = candidate.isHwAccel;
+        AG_LOG_FAST(INFO, "Selected video encoder: %s%s", candidate.name,
+                    usingHwAccel ? " (hardware accelerated)" : " (software)");
+        break;
+    }
+
     if (!codec) {
-        AG_LOG_FAST(ERROR, "Video codec not found: %s", config_.videoCodec.c_str());
+        AG_LOG_FAST(ERROR, "No suitable video encoder found");
         return false;
     }
 
@@ -752,36 +809,32 @@ bool RecordingSink::setupVideoEncoder(AVCodecContext** videoCodecContext,
     (*videoCodecContext)->bit_rate = config_.videoBitrate;
     (*videoCodecContext)->width = config_.videoWidth;
     (*videoCodecContext)->height = config_.videoHeight;
-    // Modern best practice time base for video: 1/90000 (MPEG-2/H.264 standard)
-    // This is the standard time base used in modern video containers and codecs
     (*videoCodecContext)->time_base = {1, 90000};
     (*videoCodecContext)->framerate = {config_.videoFps, 1};
     (*videoCodecContext)->gop_size = config_.videoFps;
-    (*videoCodecContext)->max_b_frames = 0;  // Disable B-frames for stability
-    (*videoCodecContext)->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    // Add encoder options for stability and non-blocking behavior
+    (*videoCodecContext)->max_b_frames = 0;
+    (*videoCodecContext)->pix_fmt = selectedPixFmt;
     (*videoCodecContext)->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-    // CRITICAL: Configure threading to prevent blocking
-    (*videoCodecContext)->thread_count = 1;  // Single thread for predictable behavior
+    (*videoCodecContext)->thread_count = 1;
     (*videoCodecContext)->thread_type = FF_THREAD_SLICE;
 
-    // Set codec options for stability and low-latency
     AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "preset", "fast", 0);  // Fast encoding with better quality than ultrafast
-    av_dict_set(&opts, "tune", "zerolatency", 0);
-    av_dict_set(&opts, "x264-params", "force-cfr=1", 0);  // Force constant frame rate
-    av_dict_set(&opts, "fflags", "+flush_packets", 0);    // Flush packets immediately
+    if (usingHwAccel) {
+        av_dict_set(&opts, "preset", "fast", 0);
+    } else {
+        av_dict_set(&opts, "preset", "fast", 0);
+        av_dict_set(&opts, "tune", "zerolatency", 0);
+        av_dict_set(&opts, "x264-params", "force-cfr=1", 0);
+    }
+    av_dict_set(&opts, "fflags", "+flush_packets", 0);
 
     if (avcodec_open2(*videoCodecContext, codec, &opts) < 0) {
-        AG_LOG_FAST(ERROR, "Failed to open video codec");
+        AG_LOG_FAST(ERROR, "Failed to open video codec: %s", codec->name);
         av_dict_free(&opts);
         return false;
     }
 
     av_dict_free(&opts);
-
     return true;
 }
 
