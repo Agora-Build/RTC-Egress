@@ -548,7 +548,9 @@ bool TaskPipe::ensureConnected(const std::string& channel, const std::string& to
     auto& state = channel_states_[channel];
 
     if (!state.is_connected) {
-        logInfo("Connecting to channel: " + channel, instance_id_);
+        logInfo("Connecting to channel: " + channel + " (decode mode: " +
+                    std::to_string(static_cast<int>(rtc_client_->config().videoDecodeMode)) + ")",
+                instance_id_);
 
         rtc_client_->setChannel(channel);
         if (!token.empty()) {
@@ -564,6 +566,11 @@ bool TaskPipe::ensureConnected(const std::string& channel, const std::string& to
         }
 
         state.is_connected = true;
+    } else {
+        // Already connected — decode mode and observers were set during initial connect.
+        // Workers are single-use, so this typically means snapshot + recording share a channel.
+        logInfo("Channel " + channel + " already connected, reusing existing connection",
+                instance_id_);
     }
 
     logDebug("Channel " + channel + " task count: " + std::to_string(state.active_tasks.size()),

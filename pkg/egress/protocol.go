@@ -309,8 +309,12 @@ func ValidateStartTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 
-	// Validate uid array elements
-	if uidVal, ok := payload["uid"]; ok && uidVal != nil {
+	// Validate users array elements (API uses "users" field, mapped to uid in UDS message)
+	uidVal := payload["users"]
+	if uidVal == nil {
+		uidVal = payload["uid"] // fallback for backwards compatibility
+	}
+	if uidVal != nil {
 		switch v := uidVal.(type) {
 		case []string:
 			for i, uid := range v {
@@ -508,9 +512,13 @@ func validateTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 	// Validate user count (optional, only if present and non-empty)
-	uidVal, ok := payload["uid"]
-	if ok && uidVal != nil {
-		switch v := uidVal.(type) {
+	// API uses "users" field; fall back to "uid" for backwards compatibility
+	usersVal, usersOk := payload["users"]
+	if !usersOk || usersVal == nil {
+		usersVal, usersOk = payload["uid"]
+	}
+	if usersOk && usersVal != nil {
+		switch v := usersVal.(type) {
 		case []string:
 			if len(v) > 32 {
 				return fmt.Errorf("users must be at most 32")

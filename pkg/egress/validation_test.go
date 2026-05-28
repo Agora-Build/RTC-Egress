@@ -582,7 +582,7 @@ func TestValidateStartTaskRequest_UidWithInvalidChars(t *testing.T) {
 			"channel":      "test-channel",
 			"access_token": "test-token-12345",
 			"workerUid":    float64(42),
-			"uid":          []interface{}{"user@invalid"},
+			"users":        []interface{}{"user@invalid"},
 		},
 	}
 	err := ValidateStartTaskRequest(req)
@@ -600,7 +600,7 @@ func TestValidateStartTaskRequest_EmptyUidInArray(t *testing.T) {
 			"channel":      "test-channel",
 			"access_token": "test-token-12345",
 			"workerUid":    float64(42),
-			"uid":          []interface{}{"user1", ""},
+			"users":        []interface{}{"user1", ""},
 		},
 	}
 	err := ValidateStartTaskRequest(req)

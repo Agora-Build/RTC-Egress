@@ -2,6 +2,8 @@
 
 #include "include/encoded_frame_decoder.h"
 
+#include <chrono>
+
 #include "common/log.h"
 
 namespace agora {

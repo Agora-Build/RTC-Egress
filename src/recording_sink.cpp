@@ -1141,6 +1141,7 @@ bool RecordingSink::encodeAudioFrame(const AudioFrame& frame, const std::string&
     if (config_.mode == VideoCompositor::Mode::Individual) {
         // In passthrough mode, route audio to passthrough context (if it exists)
         if (config_.videoDecodeMode == 0) {
+            std::lock_guard<std::mutex> lock(userContextsMutex_);
             auto it = passthroughContexts_.find(userId);
             if (it != passthroughContexts_.end()) {
                 return encodePassthroughAudioFrame(frame, it->second.get(), userId);
@@ -2890,8 +2891,27 @@ bool RecordingSink::writePassthroughVideoPacket(PassthroughContext* ctx, const u
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return false;
 
-    pkt->data = avccData.data();
-    pkt->size = static_cast<int>(avccData.size());
+    // Allocate FFmpeg-owned buffer and copy data so the packet owns its memory.
+    // Without this, pkt->data would point to the local avccData vector which
+    // becomes invalid after this scope — av_interleaved_write_frame may still
+    // reference the buffer internally.
+    int pktSize = static_cast<int>(avccData.size());
+    uint8_t* pktData = static_cast<uint8_t*>(av_malloc(pktSize + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (!pktData) {
+        av_packet_free(&pkt);
+        return false;
+    }
+    memcpy(pktData, avccData.data(), pktSize);
+    memset(pktData + pktSize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+    // av_packet_from_data takes ownership of pktData — it will be freed
+    // when the packet is freed.
+    if (av_packet_from_data(pkt, pktData, pktSize) < 0) {
+        av_free(pktData);
+        av_packet_free(&pkt);
+        return false;
+    }
+
     pkt->stream_index = ctx->videoStream->index;
     pkt->pts = pts;
     pkt->dts = pts;

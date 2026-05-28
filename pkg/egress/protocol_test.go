@@ -478,7 +478,7 @@ func TestBuildUDSMessageFromQueueTaskIntervalInvalidType(t *testing.T) {
 		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
 		Payload: map[string]interface{}{
 			"channel": "demo", "access_token": "token-123456",
-			"workerUid":    float64(42),
+			"workerUid":      float64(42),
 			"interval_in_ms": "not-a-number",
 		},
 	}
