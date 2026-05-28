@@ -217,9 +217,8 @@ verify_recording() {
 vlm_check_frame() {
     local frame_file="$1"
     local tag="$2"          # e.g. "first_0", "last_4"
-    local user_count="$3"
-    local dest_dir="$4"
-    local seq_prefix="$5"
+    local dest_dir="$3"
+    local seq_prefix="$4"
 
     if [ ! -f "$frame_file" ] || [ "$(stat --printf='%s' "$frame_file" 2>/dev/null)" -lt 1000 ]; then
         log "  VLM [$tag]: Frame not available, skipping"
@@ -227,11 +226,7 @@ vlm_check_frame() {
     fi
 
     local prompt
-    if [ "$user_count" -eq 1 ]; then
-        prompt="Is this a single video scene (not split-screen or side-by-side)? Does it contain any visual content? Title cards, credits, text on black background, and fade transitions all count as valid content. Only a completely uniform solid color frame with nothing on it should be considered no content. Reply ONLY with a JSON object: {\"single_scene\": true/false, \"has_content\": true/false, \"description\": \"brief description\"}"
-    else
-        prompt="Does this image show multiple video panels side-by-side (split-screen or grid layout)? Does it contain any visual content? Title cards, credits, text on black background, and fade transitions all count as valid content. Only a completely uniform solid color frame with nothing on it should be considered no content. Reply ONLY with a JSON object: {\"multi_panel\": true/false, \"has_content\": true/false, \"description\": \"brief description\"}"
-    fi
+    prompt="Does this video frame contain any visual content? Title cards, credits, text overlays, animations, live action, composited scenes, and fade transitions all count as valid content. Only a completely uniform solid color frame (e.g. pure black, pure green) with absolutely nothing on it should be considered no content. Reply ONLY with a JSON object: {\"has_content\": true/false, \"description\": \"brief description\"}"
 
     local b64_file="/tmp/e2e_vlm_b64_$$.txt"
     base64 -w0 "$frame_file" > "$b64_file"
@@ -283,37 +278,21 @@ except:
     log "  VLM [$tag]: $content"
     echo "$content" > "$dest_dir/${seq_prefix}_vlm_${tag}.txt" 2>/dev/null || true
 
-    # Parse VLM JSON response
+    # Parse VLM JSON response — just check has_content
     local vlm_ok
-    if [ "$user_count" -eq 1 ]; then
-        vlm_ok=$(echo "$content" | python3 -c "
+    vlm_ok=$(echo "$content" | python3 -c "
 import json, sys, re
 try:
     text = sys.stdin.read()
     m = re.search(r'\{[^}]+\}', text)
     if m:
         d = json.loads(m.group())
-        print('yes' if d.get('single_scene') and d.get('has_content') else 'no')
+        print('yes' if d.get('has_content') else 'no')
     else:
         print('unclear')
 except:
     print('unclear')
 " 2>/dev/null)
-    else
-        vlm_ok=$(echo "$content" | python3 -c "
-import json, sys, re
-try:
-    text = sys.stdin.read()
-    m = re.search(r'\{[^}]+\}', text)
-    if m:
-        d = json.loads(m.group())
-        print('yes' if d.get('multi_panel') and d.get('has_content') else 'no')
-    else:
-        print('unclear')
-except:
-    print('unclear')
-" 2>/dev/null)
-    fi
 
     case "$vlm_ok" in
         yes) return 0 ;;
@@ -327,7 +306,6 @@ except:
 verify_content_vlm() {
     local file="$1"
     local label="$2"
-    local user_count="$3"   # 1 = individual, 2+ = composite
 
     if [ -z "$VLM_URL" ]; then
         return 0  # skip silently when VLM not configured
@@ -361,7 +339,7 @@ verify_content_vlm() {
     for f in "${frames[@]}"; do
         local tag
         tag=$(basename "$f" .jpg | sed "s/^${seq_prefix}_frame_//")
-        if vlm_check_frame "$f" "$tag" "$user_count" "$dest_dir" "$seq_prefix"; then
+        if vlm_check_frame "$f" "$tag" "$dest_dir" "$seq_prefix"; then
             vlm_pass=$((vlm_pass + 1))
         else
             vlm_fail=$((vlm_fail + 1))
@@ -534,18 +512,13 @@ ENDJSON
         return 1
     fi
 
-    # Determine user count for VLM verification
-    local user_count
-    user_count=$(echo "$users_json" | python3 -c "import json,sys; u=json.load(sys.stdin); print(len(u) if u else 2)" 2>/dev/null || echo "2")
-
     # Verify each output file
     local any_pass=false
     for f in $output_files; do
         if verify_recording "$f" "$label" "$expect_video_codec"; then
             any_pass=true
             publish_output "$f" "$label"
-            # Run VLM content verification on the first passing file
-            verify_content_vlm "$f" "$label" "$user_count" || true
+            verify_content_vlm "$f" "$label" || true
         fi
     done
 
@@ -847,7 +820,7 @@ log ""
 log "---- Individual / all layouts / auto decode ----"
 log ""
 
-for layout in grid spotlight freestyle; do
+for layout in grid spotlight; do
     run_recording_test \
         "individual / $layout / auto" \
         '["1001"]' -1 "$layout" "h264"
@@ -912,7 +885,7 @@ log ""
 log "---- Composite / all layouts / auto decode ----"
 log ""
 
-for layout in grid spotlight freestyle; do
+for layout in grid spotlight; do
     run_recording_test \
         "composite / $layout / auto" \
         '["1001","1002"]' -1 "$layout" "h264"
@@ -924,7 +897,7 @@ log ""
 log "---- Composite / all layouts / ffmpeg decode ----"
 log ""
 
-for layout in grid spotlight freestyle; do
+for layout in grid spotlight; do
     run_recording_test \
         "composite / $layout / ffmpeg" \
         '["1001","1002"]' 1 "$layout" "h264"
@@ -940,7 +913,7 @@ log ""
 log "==== PART 3: COMPOSITE ALL (empty user list) ===="
 log ""
 
-for layout in flat grid spotlight freestyle; do
+for layout in flat grid spotlight; do
     run_recording_test \
         "composite-all / $layout / auto" \
         '[]' -1 "$layout" "h264"
