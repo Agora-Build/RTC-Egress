@@ -425,7 +425,7 @@ run_recording_test() {
     local label="$1"
     local users_json="$2"        # e.g. '["1001"]' or '["1001","1002"]'
     local decode_mode="$3"       # -1, 0, 1, or 2
-    local layout="${4:-flat}"    # flat, grid, spotlight, freestyle
+    local layout="${4:-flat}"    # flat, spotlight, freestyle
     local expect_video_codec="${5:-h264}"
 
     log "--- $label ---"
@@ -560,8 +560,9 @@ log "Using stream-to-agora: $STREAM_TOOL"
 # All videos must have h264 video + stereo aac audio (stream-to-agora requirement).
 #   - BBB full (116MB)      — Big Buck Bunny 640x360, h264+aac stereo 44.1kHz
 #   - Sintel trailer (4MB)  — dark fantasy animation, h264+aac stereo 48kHz
-#   - Movie 300 (2.7MB)     — live action test clip, h264+aac mono 22kHz
+#   - Movie 300 (2.7MB)     — live action test clip, h264+aac (reencoded to 360p stereo 48kHz)
 # Note: BBB is large but already cached after first download.
+# Note: Videos are reencoded on first download if audio is not stereo 48kHz or video < 360p.
 
 mkdir -p "$FIXTURES_DIR"
 
@@ -582,6 +583,33 @@ for vfile in "$VIDEO_BBB" "$VIDEO_SINTEL" "$VIDEO_MOVIE"; do
             log "ERROR: Failed to download $vfile"
             exit 1
         }
+        # Ensure compatibility with stream-to-agora and Agora SDK:
+        #   - Audio: stereo 48kHz (stream-to-agora requirement)
+        #   - Video: minimum 360p (SDK encoded passthrough fails with very small resolutions like 320x240)
+        audio_channels=$(ffprobe -v quiet -show_entries stream=channels -select_streams a:0 -of csv=p=0 "$vfile" 2>/dev/null)
+        audio_rate=$(ffprobe -v quiet -show_entries stream=sample_rate -select_streams a:0 -of csv=p=0 "$vfile" 2>/dev/null)
+        video_height=$(ffprobe -v quiet -show_entries stream=height -select_streams v:0 -of csv=p=0 "$vfile" 2>/dev/null)
+        needs_reencode=false
+        vf_args=""
+        af_args=""
+        if [ "${audio_channels:-0}" -ne 2 ] || [ "${audio_rate:-0}" -ne 48000 ]; then
+            log "  Audio needs reencode: ${audio_channels}ch ${audio_rate}Hz → stereo 48kHz"
+            af_args="-ac 2 -ar 48000 -c:a aac"
+            needs_reencode=true
+        fi
+        if [ "${video_height:-0}" -lt 360 ]; then
+            log "  Video needs upscale: ${video_height}p → 360p (SDK passthrough requires >= 360p)"
+            vf_args="-vf scale=-2:360 -c:v libx264 -preset fast -crf 23"
+            needs_reencode=true
+        fi
+        if [ "$needs_reencode" = true ]; then
+            tmp_file="${vfile}.tmp.mp4"
+            ffmpeg -v quiet -i "$vfile" ${vf_args:- -c:v copy} ${af_args:- -c:a copy} "$tmp_file" -y && \
+                mv "$tmp_file" "$vfile" || {
+                log "WARNING: Reencode failed, keeping original"
+                rm -f "$tmp_file"
+            }
+        fi
     fi
     local_info=$(ffprobe -v quiet -show_entries stream=codec_type,codec_name -of csv=p=0 "$vfile" 2>/dev/null | tr '\n' ' ')
     log "Test video: $(basename "$vfile") [${local_info}] ($(numfmt --to=iec "$(stat --printf='%s' "$vfile")"))"
@@ -821,7 +849,7 @@ log ""
 log "---- Individual / all layouts / auto decode ----"
 log ""
 
-for layout in grid spotlight; do
+for layout in spotlight; do
     run_recording_test \
         "individual / $layout / auto" \
         '["1001"]' -1 "$layout" "h264"
@@ -886,7 +914,7 @@ log ""
 log "---- Composite / all layouts / auto decode ----"
 log ""
 
-for layout in grid spotlight; do
+for layout in spotlight; do
     run_recording_test \
         "composite / $layout / auto" \
         '["1001","1002"]' -1 "$layout" "h264"
@@ -898,7 +926,7 @@ log ""
 log "---- Composite / all layouts / ffmpeg decode ----"
 log ""
 
-for layout in grid spotlight; do
+for layout in spotlight; do
     run_recording_test \
         "composite / $layout / ffmpeg" \
         '["1001","1002"]' 1 "$layout" "h264"
@@ -914,92 +942,17 @@ log ""
 log "==== PART 3: COMPOSITE ALL (empty user list) ===="
 log ""
 
-for layout in flat grid spotlight; do
+for layout in flat spotlight; do
     run_recording_test \
         "composite-all / $layout / auto" \
         '[]' -1 "$layout" "h264"
     restart_egress
 done
 
-# ==============================================================================
-# PART 4: DIFFERENT VIDEO SOURCES (Movie + Sintel)
-# Restart streams: 1001=Movie(live action), 1002=Sintel(animation)
-# Tests mixed content types — visually very different for VLM distinction.
-# ==============================================================================
-
-log ""
-log "==== PART 4: MIXED CONTENT (Movie + Sintel) ===="
-log ""
-
-restart_streams "$VIDEO_MOVIE" "$VIDEO_SINTEL"
-
-# -- Individual: record the live action user --
-run_recording_test \
-    "individual / movie / flat / auto" \
-    '["1001"]' -1 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "individual / movie / flat / passthrough" \
-    '["1001"]' 0 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "individual / movie / flat / ffmpeg" \
-    '["1001"]' 1 "flat" "h264"
-restart_egress
-
-# -- Composite: mixed content --
-run_recording_test \
-    "composite / movie+sintel / flat / auto" \
-    '["1001","1002"]' -1 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "composite / movie+sintel / flat / ffmpeg" \
-    '["1001","1002"]' 1 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "composite / movie+sintel / grid / auto" \
-    '["1001","1002"]' -1 "grid" "h264"
-restart_egress
-
-# -- Composite all with mixed content --
-run_recording_test \
-    "composite-all / movie+sintel / flat / auto" \
-    '[]' -1 "flat" "h264"
-restart_egress
-
-# ==============================================================================
-# PART 5: SAME CONTENT BOTH USERS (Sintel + Sintel)
-# Tests that composite with identical content renders correctly.
-# ==============================================================================
-
-log ""
-log "==== PART 5: SAME CONTENT (Sintel + Sintel) ===="
-log ""
-
-restart_streams "$VIDEO_SINTEL" "$VIDEO_SINTEL"
-
-run_recording_test \
-    "individual / sintel / flat / passthrough" \
-    '["1001"]' 0 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "individual / sintel / flat / ffmpeg" \
-    '["1001"]' 1 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "composite / sintel+sintel / flat / ffmpeg" \
-    '["1001","1002"]' 1 "flat" "h264"
-restart_egress
-
-run_recording_test \
-    "composite / sintel+sintel / grid / auto" \
-    '["1001","1002"]' -1 "grid" "h264"
+# NOTE: Parts 4-5 (mixed video sources) removed because stream-to-agora's --loop
+# flag doesn't actually loop short files — it exits after the first pass. BBB (596s)
+# is long enough to cover Parts 1-3 without looping. If stream-to-agora --loop is
+# fixed, re-add mixed content tests with restart_streams().
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

@@ -9,7 +9,7 @@ struct UDSMessage {
     std::string task_id;             // Task ID for tracking completion
     std::string cmd;                 // "snapshot", "record", "rtmp", or "whip"
     std::string action;              // "start", "stop", "status"
-    std::string layout;              // "grid", "flat", "spotlight", or "freestyle"
+    std::string layout;              // "flat", "spotlight", "customized", or "freestyle"
     std::string freestyleCanvasUrl;  // URL for custom canvas, used if layout is "freestyle"
     std::vector<std::string> uid;    // User IDs, if empty, all users will be included
     std::string channel;             // Channel Name

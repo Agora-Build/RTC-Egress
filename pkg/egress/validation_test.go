@@ -245,7 +245,7 @@ func TestValidateUDSMessage_AllValidCmds(t *testing.T) {
 }
 
 func TestValidateUDSMessage_AllValidLayouts(t *testing.T) {
-	for _, layout := range []string{"flat", "grid", "spotlight", "freestyle"} {
+	for _, layout := range []string{"flat", "spotlight", "customized", "freestyle"} {
 		msg := &UDSMessage{
 			Cmd:    "record",
 			Action: "stop",

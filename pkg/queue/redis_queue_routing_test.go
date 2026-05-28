@@ -34,18 +34,10 @@ func TestGetQueueKey_FreestyleWithRegion(t *testing.T) {
 	}
 }
 
-func TestGetQueueKey_GridLayoutIsNative(t *testing.T) {
-	rq := NewRedisQueue("localhost:6379", "", 0, 60, "")
-	got := rq.getQueueKey("grid", "record", "chan5", "")
-	if got != "egress:record:chan5" {
-		t.Fatalf("grid layout should route to native queue, got %q", got)
-	}
-}
-
 func TestGetQueueKey_SpotlightLayoutIsNative(t *testing.T) {
 	rq := NewRedisQueue("localhost:6379", "", 0, 60, "")
-	got := rq.getQueueKey("spotlight", "snapshot", "chan6", "")
-	if got != "egress:snapshot:chan6" {
+	got := rq.getQueueKey("spotlight", "record", "chan5", "")
+	if got != "egress:record:chan5" {
 		t.Fatalf("spotlight layout should route to native queue, got %q", got)
 	}
 }

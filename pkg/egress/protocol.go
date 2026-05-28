@@ -14,7 +14,7 @@ type UDSMessage struct {
 	TaskID             string   `json:"task_id"`            // Task ID for tracking completion
 	Cmd                string   `json:"cmd"`                // "snapshot", "record", "rtmp", or "whip"
 	Action             string   `json:"action"`             // "start", "stop", "status"
-	Layout             string   `json:"layout"`             // "grid", "flat", "spotlight", or "freestyle"
+	Layout             string   `json:"layout"`             // "flat", "spotlight", "customized", or "freestyle"
 	FreestyleCanvasUrl string   `json:"freestyleCanvasUrl"` // URL for custom canvas, used if layout is "freestyle"
 	Uid                []string `json:"uid"`                // User IDs, if empty, all users will be included
 	Channel            string   `json:"channel"`            // Channel Name
@@ -184,9 +184,9 @@ func ValidateUDSMessage(msg *UDSMessage) error {
 	}
 
 	// Validate layout
-	validLayouts := map[string]bool{"flat": true, "grid": true, "spotlight": true, "freestyle": true}
+	validLayouts := map[string]bool{"flat": true, "spotlight": true, "customized": true, "freestyle": true}
 	if !validLayouts[msg.Layout] {
-		return fmt.Errorf("layout %s is not supported, only flat, grid, spotlight, and freestyle are supported", msg.Layout)
+		return fmt.Errorf("layout %s is not supported, only flat, spotlight, customized, and freestyle are supported", msg.Layout)
 	}
 
 	// Validate freestyleCanvasUrl if present
@@ -485,9 +485,9 @@ func validateTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 	payload["layout"] = layoutStr
-	validLayouts := map[string]bool{"flat": true, "grid": true, "spotlight": true, "freestyle": true}
+	validLayouts := map[string]bool{"flat": true, "spotlight": true, "customized": true, "freestyle": true}
 	if !validLayouts[layoutStr] {
-		return fmt.Errorf("layout %s not supported, only flat, grid, spotlight, and freestyle are supported", layoutStr)
+		return fmt.Errorf("layout %s not supported, only flat, spotlight, customized, and freestyle are supported", layoutStr)
 	}
 	// Validate freestyleCanvasUrl (optional, only if present and non-empty)
 	canvasVal, ok := payload["freestyleCanvasUrl"]
