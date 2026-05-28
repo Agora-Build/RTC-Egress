@@ -385,3 +385,412 @@ func TestDeriveCompletionResultUnknownStatus(t *testing.T) {
 		t.Fatalf("expected FAILED for unknown status, got %q", status)
 	}
 }
+
+func TestDeriveCompletionResultSuccess(t *testing.T) {
+	completion := &UDSCompletionMessage{
+		TaskID:  "task-1",
+		Status:  "success",
+		Message: "recording complete",
+	}
+
+	status, message := deriveCompletionResult(completion)
+
+	if status != queue.TaskStateStopped {
+		t.Fatalf("expected STOPPED for success, got %q", status)
+	}
+	if message != "recording complete" {
+		t.Fatalf("expected message 'recording complete', got %q", message)
+	}
+}
+
+func TestDeriveCompletionResultFailureUsesErrorWhenNoMessage(t *testing.T) {
+	completion := &UDSCompletionMessage{
+		TaskID: "task-1",
+		Status: "failed",
+		Error:  "IO error",
+	}
+
+	status, message := deriveCompletionResult(completion)
+
+	if status != queue.TaskStateFailed {
+		t.Fatalf("expected FAILED, got %q", status)
+	}
+	if message != "IO error" {
+		t.Fatalf("expected error message 'IO error', got %q", message)
+	}
+}
+
+// --- ValidateStartTaskRequest ---
+
+func TestValidateStartTaskRequest_Valid(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+			"layout":       "flat",
+		},
+	}
+	if err := ValidateStartTaskRequest(req); err != nil {
+		t.Fatalf("expected valid, got error: %v", err)
+	}
+}
+
+func TestValidateStartTaskRequest_NilPayload(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload:   nil,
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for nil payload")
+	}
+}
+
+func TestValidateStartTaskRequest_ChannelTooLong(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      strings.Repeat("x", 65),
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for channel > 64 chars")
+	}
+}
+
+func TestValidateStartTaskRequest_ChannelInvalidChars(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "chan with spaces",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for channel with spaces")
+	}
+}
+
+func TestValidateStartTaskRequest_AccessTokenTooShort(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "short",
+			"workerUid":    float64(42),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for access_token < 10 chars")
+	}
+}
+
+func TestValidateStartTaskRequest_AccessTokenTooLong(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": strings.Repeat("x", 513),
+			"workerUid":    float64(42),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for access_token > 512 chars")
+	}
+}
+
+func TestValidateStartTaskRequest_WorkerUidOutOfRange(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(0),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for workerUid = 0")
+	}
+}
+
+func TestValidateStartTaskRequest_IntervalTooSmall(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "snapshot",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":        "test-channel",
+			"access_token":   "test-token-12345",
+			"workerUid":      float64(42),
+			"interval_in_ms": float64(500),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for interval_in_ms < 1000")
+	}
+}
+
+func TestValidateStartTaskRequest_IntervalTooLarge(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "snapshot",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":        "test-channel",
+			"access_token":   "test-token-12345",
+			"workerUid":      float64(42),
+			"interval_in_ms": float64(400000),
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for interval_in_ms > 300000")
+	}
+}
+
+func TestValidateStartTaskRequest_UidWithInvalidChars(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+			"uid":          []interface{}{"user@invalid"},
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for uid with invalid chars")
+	}
+}
+
+func TestValidateStartTaskRequest_EmptyUidInArray(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+			"uid":          []interface{}{"user1", ""},
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for empty uid in array")
+	}
+}
+
+func TestValidateStartTaskRequest_InvalidLayout(t *testing.T) {
+	req := &TaskRequest{
+		RequestID: "req123",
+		Cmd:       "record",
+		Action:    "start",
+		Payload: map[string]interface{}{
+			"channel":      "test-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+			"layout":       "grid",
+		},
+	}
+	err := ValidateStartTaskRequest(req)
+	if err == nil {
+		t.Fatal("expected error for invalid layout 'grid'")
+	}
+}
+
+func TestValidateStartTaskRequest_AllValidLayouts(t *testing.T) {
+	for _, layout := range []string{"flat", "spotlight", "customized", "freestyle"} {
+		req := &TaskRequest{
+			RequestID: "req123",
+			Cmd:       "record",
+			Action:    "start",
+			Payload: map[string]interface{}{
+				"channel":      "test-channel",
+				"access_token": "test-token-12345",
+				"workerUid":    float64(42),
+				"layout":       layout,
+			},
+		}
+		if err := ValidateStartTaskRequest(req); err != nil {
+			t.Fatalf("layout %q should be valid, got error: %v", layout, err)
+		}
+	}
+}
+
+// --- ValidateTaskID boundary ---
+
+func TestValidateTaskID_ExactMax64(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	if err := ValidateTaskID(id); err != nil {
+		t.Fatalf("expected valid for 64-char hex ID, got error: %v", err)
+	}
+}
+
+func TestValidateTaskID_SingleChar(t *testing.T) {
+	if err := ValidateTaskID("a"); err != nil {
+		t.Fatalf("expected valid for 1-char hex ID, got error: %v", err)
+	}
+}
+
+// --- ValidateRequestID boundary ---
+
+func TestValidateRequestID_ExactMax32(t *testing.T) {
+	id := strings.Repeat("a", 32)
+	if err := ValidateRequestID(id); err != nil {
+		t.Fatalf("expected valid for 32-char request ID, got error: %v", err)
+	}
+}
+
+func TestValidateRequestID_SingleChar(t *testing.T) {
+	if err := ValidateRequestID("a"); err != nil {
+		t.Fatalf("expected valid for 1-char request ID, got error: %v", err)
+	}
+}
+
+// --- ValidateRedisTask valid start task ---
+
+func TestValidateRedisTask_ValidStartTask(t *testing.T) {
+	task := &queue.Task{
+		ID:        "abcdef1234567890",
+		Cmd:       "record",
+		Action:    "start",
+		Channel:   "valid-channel",
+		RequestID: "req123",
+		Payload: map[string]interface{}{
+			"channel":      "valid-channel",
+			"access_token": "test-token-12345",
+			"workerUid":    float64(42),
+		},
+	}
+	err := ValidateRedisTask(task)
+	if err != nil {
+		t.Fatalf("expected valid start task, got error: %v", err)
+	}
+}
+
+func TestValidateRedisTask_EmptyRequestIDAllowed(t *testing.T) {
+	task := &queue.Task{
+		ID:      "abcdef1234567890",
+		Cmd:     "record",
+		Action:  "stop",
+		Channel: "valid-channel",
+	}
+	err := ValidateRedisTask(task)
+	if err != nil {
+		t.Fatalf("expected valid task with empty request ID, got error: %v", err)
+	}
+}
+
+func TestValidateRedisTask_InvalidRequestIDFormat(t *testing.T) {
+	task := &queue.Task{
+		ID:        "abcdef1234567890",
+		Cmd:       "record",
+		Action:    "stop",
+		Channel:   "valid-channel",
+		RequestID: "req-with-dashes",
+	}
+	err := ValidateRedisTask(task)
+	if err == nil {
+		t.Fatal("expected error for invalid request ID format")
+	}
+}
+
+// --- ValidateUDSMessage videoDecodeMode boundary ---
+
+func TestValidateUDSMessage_VideoDecodeModeBoundary(t *testing.T) {
+	for _, mode := range []int{-1, 0, 1, 2} {
+		msg := &UDSMessage{
+			Cmd: "record", Action: "stop", Layout: "flat",
+			VideoDecodeMode: mode,
+		}
+		if err := ValidateUDSMessage(msg); err != nil {
+			t.Fatalf("videoDecodeMode %d should be valid, got error: %v", mode, err)
+		}
+	}
+}
+
+func TestValidateUDSMessage_VideoDecodeModeNegative2(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "stop", Layout: "flat",
+		VideoDecodeMode: -2,
+	}
+	err := ValidateUDSMessage(msg)
+	if err == nil {
+		t.Fatal("expected error for videoDecodeMode = -2")
+	}
+}
+
+func TestValidateUDSMessage_VideoDecodeMode3(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "stop", Layout: "flat",
+		VideoDecodeMode: 3,
+	}
+	err := ValidateUDSMessage(msg)
+	if err == nil {
+		t.Fatal("expected error for videoDecodeMode = 3")
+	}
+}
+
+// --- ValidateUDSMessage edge cases ---
+
+func TestValidateUDSMessage_Exactly32UIDs(t *testing.T) {
+	uids := make([]string, 32)
+	for i := range uids {
+		uids[i] = "user"
+	}
+	msg := &UDSMessage{
+		Cmd: "record", Action: "stop", Layout: "flat",
+		Uid: uids,
+	}
+	if err := ValidateUDSMessage(msg); err != nil {
+		t.Fatalf("expected valid with exactly 32 UIDs, got error: %v", err)
+	}
+}
+
+func TestValidateUDSMessage_ValidHttpsCanvasUrl(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "stop", Layout: "flat",
+		FreestyleCanvasUrl: "https://example.com/canvas",
+	}
+	if err := ValidateUDSMessage(msg); err != nil {
+		t.Fatalf("expected valid https canvas URL, got error: %v", err)
+	}
+}
+
+func TestValidateUDSMessage_StatusAction(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "status", Layout: "flat",
+	}
+	if err := ValidateUDSMessage(msg); err != nil {
+		t.Fatalf("expected status action to be valid, got error: %v", err)
+	}
+}

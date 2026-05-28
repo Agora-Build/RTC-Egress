@@ -357,6 +357,176 @@ verify_content_vlm() {
     return 0
 }
 
+# Send a single frame to VLM and ask whether it shows multiple video panels.
+# Returns 0 if multi-panel detected, 1 if single/no panel, 2 if unclear/skip.
+vlm_check_multi_panel() {
+    local frame_file="$1"
+    local expected_panels="$2"  # e.g. 2
+    local tag="$3"
+    local dest_dir="$4"
+    local seq_prefix="$5"
+
+    if [ ! -f "$frame_file" ] || [ "$(stat --printf='%s' "$frame_file" 2>/dev/null)" -lt 1000 ]; then
+        log "  VLM panel [$tag]: Frame not available, skipping"
+        return 2
+    fi
+
+    local prompt
+    prompt="This frame is from a composite video recording where ${expected_panels} users' video streams should be tiled side-by-side or in a grid on a single canvas. Count how many distinct video panels (separate rectangular regions showing different video content) are visible. Ignore borders, letterboxing, or black padding. Reply ONLY with a JSON object: {\"panel_count\": <number>, \"description\": \"brief description of what you see\"}"
+
+    local b64_file="/tmp/e2e_vlm_panel_b64_$$.txt"
+    base64 -w0 "$frame_file" > "$b64_file"
+
+    local vlm_payload="/tmp/e2e_vlm_panel_payload_$$.json"
+    python3 - "$VLM_MODEL" "$prompt" "$b64_file" "$vlm_payload" <<'PYEOF'
+import json, sys
+model, prompt, b64_path, out_path = sys.argv[1:5]
+with open(b64_path) as f:
+    b64 = f.read()
+msg = {
+    "model": model,
+    "max_tokens": 200,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+    ]}]
+}
+with open(out_path, "w") as f:
+    json.dump(msg, f)
+PYEOF
+    rm -f "$b64_file"
+
+    local vlm_response
+    vlm_response=$(curl -sf --max-time 30 "$VLM_URL" \
+        -H "Content-Type: application/json" \
+        -d @"$vlm_payload" 2>/dev/null) || {
+        rm -f "$vlm_payload"
+        log "  VLM panel [$tag]: Request failed, skipping"
+        return 2
+    }
+    rm -f "$vlm_payload"
+
+    local content
+    content=$(echo "$vlm_response" | python3 -c "
+import json, sys
+try:
+    r = json.load(sys.stdin)
+    print(r['choices'][0]['message']['content'])
+except:
+    print('')
+" 2>/dev/null)
+
+    if [ -z "$content" ]; then
+        log "  VLM panel [$tag]: Empty response, skipping"
+        return 2
+    fi
+
+    log "  VLM panel [$tag]: $content"
+    echo "$content" > "$dest_dir/${seq_prefix}_vlm_panel_${tag}.txt" 2>/dev/null || true
+
+    # Parse panel_count from VLM response
+    local panel_count
+    panel_count=$(echo "$content" | python3 -c "
+import json, sys, re
+try:
+    text = sys.stdin.read()
+    m = re.search(r'\{[^}]+\}', text)
+    if m:
+        d = json.loads(m.group())
+        print(int(d.get('panel_count', 0)))
+    else:
+        print(-1)
+except:
+    print(-1)
+" 2>/dev/null)
+
+    if [ "$panel_count" = "-1" ]; then
+        return 2  # unclear
+    fi
+
+    if [ "$panel_count" -ge "$expected_panels" ]; then
+        return 0  # pass: found expected number of panels
+    else
+        log "  VLM panel [$tag]: expected >= $expected_panels panels, got $panel_count"
+        return 1  # fail
+    fi
+}
+
+# Verify that a composite recording shows multiple video panels.
+# Checks 3 mid-range frames (to avoid title cards / fade transitions at start/end).
+# Only called for composite recordings with 2+ users.
+verify_multi_panel_vlm() {
+    local file="$1"
+    local label="$2"
+    local expected_panels="$3"  # number of users = expected panel count
+
+    if [ -z "$VLM_URL" ]; then
+        return 0
+    fi
+
+    if [ "$expected_panels" -lt 2 ]; then
+        return 0  # individual mode, skip panel check
+    fi
+
+    local seq_prefix
+    seq_prefix=$(printf "%02d" "$TEST_SEQ")
+    local safe_label
+    safe_label=$(echo "$label" | sed 's/[^a-zA-Z0-9_]/_/g' | sed 's/__*/_/g')
+    local dest_dir="$E2E_OUTPUT_DIR/${seq_prefix}_${safe_label}"
+
+    # Use mid frames for panel check (avoid first/last which may have transitions)
+    local mid_frames=()
+    local f
+    for f in "$dest_dir/${seq_prefix}_frame_mid_"*.jpg; do
+        [ -f "$f" ] && mid_frames+=("$f")
+    done
+
+    if [ ${#mid_frames[@]} -eq 0 ]; then
+        log "  VLM panel: No mid frames to check"
+        return 0
+    fi
+
+    # Check up to 3 mid frames (spread evenly)
+    local check_frames=()
+    local total=${#mid_frames[@]}
+    if [ "$total" -le 3 ]; then
+        check_frames=("${mid_frames[@]}")
+    else
+        # Pick first, middle, last of mid frames
+        check_frames+=("${mid_frames[0]}")
+        check_frames+=("${mid_frames[$((total / 2))]}")
+        check_frames+=("${mid_frames[$((total - 1))]}")
+    fi
+
+    local panel_pass=0 panel_fail=0 panel_skip=0
+    for f in "${check_frames[@]}"; do
+        local tag
+        tag=$(basename "$f" .jpg | sed "s/^${seq_prefix}_frame_//")
+        vlm_check_multi_panel "$f" "$expected_panels" "$tag" "$dest_dir" "$seq_prefix"
+        local rc=$?
+        case $rc in
+            0) panel_pass=$((panel_pass + 1)) ;;
+            1) panel_fail=$((panel_fail + 1)) ;;
+            2) panel_skip=$((panel_skip + 1)) ;;
+        esac
+    done
+
+    local checked=$((panel_pass + panel_fail))
+    if [ "$checked" -eq 0 ]; then
+        log "  VLM panel: All frames skipped"
+        return 0
+    fi
+
+    # Require majority of checked frames to show multi-panel
+    if [ "$panel_pass" -gt "$panel_fail" ]; then
+        pass "VLM multi-panel check: $label ($panel_pass/$checked frames show ${expected_panels}+ panels)"
+        return 0
+    else
+        fail "VLM multi-panel check: $label" "Only $panel_pass/$checked frames show ${expected_panels}+ panels"
+        return 1
+    fi
+}
+
 # Extract key frames from a recording into the output directory.
 # Produces: first 5 frames, last 5 frames, and one frame every 2 seconds in between.
 publish_output() {
@@ -429,6 +599,15 @@ run_recording_test() {
     local expect_video_codec="${5:-h264}"
 
     log "--- $label ---"
+
+    # Count expected users for multi-panel VLM check
+    # '["1001","1002"]' → 2, '["1001"]' → 1, '[]' → 0 (composite-all, expect 2+ from channel)
+    local user_count
+    user_count=$(echo "$users_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+    # For composite-all (empty list), we know 2 streams are active in the channel
+    if [ "$user_count" -eq 0 ]; then
+        user_count=2
+    fi
 
     # Generate fresh worker token
     local worker_token
@@ -519,6 +698,10 @@ ENDJSON
             any_pass=true
             publish_output "$f" "$label"
             verify_content_vlm "$f" "$label" || true
+            # For composite recordings (2+ users), verify multiple panels are visible
+            if [ "$user_count" -ge 2 ]; then
+                verify_multi_panel_vlm "$f" "$label" "$user_count" || true
+            fi
         fi
     done
 
@@ -844,17 +1027,25 @@ else
     restart_egress
 fi
 
-# -- All layouts × auto decode --
+# -- Spotlight layout × multiple decode modes --
 log ""
-log "---- Individual / all layouts / auto decode ----"
+log "---- Individual / spotlight / multiple decode modes ----"
 log ""
 
-for layout in spotlight; do
-    run_recording_test \
-        "individual / $layout / auto" \
-        '["1001"]' -1 "$layout" "h264"
-    restart_egress
-done
+run_recording_test \
+    "individual / spotlight / auto" \
+    '["1001"]' -1 "spotlight" "h264"
+restart_egress
+
+run_recording_test \
+    "individual / spotlight / passthrough" \
+    '["1001"]' 0 "spotlight" "h264"
+restart_egress
+
+run_recording_test \
+    "individual / spotlight / ffmpeg" \
+    '["1001"]' 1 "spotlight" "h264"
+restart_egress
 
 # -- Individual recording user 1002 (Sintel content) --
 log ""
@@ -869,6 +1060,11 @@ restart_egress
 run_recording_test \
     "individual(1002) / flat / ffmpeg" \
     '["1002"]' 1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "individual(1002) / spotlight / auto" \
+    '["1002"]' -1 "spotlight" "h264"
 restart_egress
 
 # ==============================================================================
@@ -942,10 +1138,19 @@ log ""
 log "==== PART 3: COMPOSITE ALL (empty user list) ===="
 log ""
 
+# -- Auto decode × multiple layouts --
 for layout in flat spotlight; do
     run_recording_test \
         "composite-all / $layout / auto" \
         '[]' -1 "$layout" "h264"
+    restart_egress
+done
+
+# -- FFmpeg decode × flat and spotlight --
+for layout in flat spotlight; do
+    run_recording_test \
+        "composite-all / $layout / ffmpeg" \
+        '[]' 1 "$layout" "h264"
     restart_egress
 done
 

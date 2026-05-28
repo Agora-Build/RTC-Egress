@@ -76,9 +76,48 @@ func TestGenerateTaskID_Deterministic(t *testing.T) {
 	}
 }
 
+func TestGetQueueKey_CustomizedLayoutIsNative(t *testing.T) {
+	rq := NewRedisQueue("localhost:6379", "", 0, 60, "")
+	got := rq.getQueueKey("customized", "record", "chan6", "")
+	if got != "egress:record:chan6" {
+		t.Fatalf("customized layout should route to native queue, got %q", got)
+	}
+}
+
+func TestGetQueueKey_CustomizedLayoutWithRegion(t *testing.T) {
+	rq := NewRedisQueue("localhost:6379", "", 0, 60, "ap-east")
+	got := rq.getQueueKey("customized", "snapshot", "chan7", "ap-east")
+	if got != "egress:ap-east:snapshot:chan7" {
+		t.Fatalf("expected 'egress:ap-east:snapshot:chan7', got %q", got)
+	}
+}
+
+func TestGetQueueKey_SpotlightWithRegion(t *testing.T) {
+	rq := NewRedisQueue("localhost:6379", "", 0, 60, "us-east")
+	got := rq.getQueueKey("spotlight", "record", "chan8", "us-east")
+	if got != "egress:us-east:record:chan8" {
+		t.Fatalf("expected 'egress:us-east:record:chan8', got %q", got)
+	}
+}
+
+func TestGetQueueKey_FreestyleSnapshot(t *testing.T) {
+	rq := NewRedisQueue("localhost:6379", "", 0, 60, "")
+	got := rq.getQueueKey("freestyle", "snapshot", "chan9", "")
+	if got != "egress:web:snapshot:chan9" {
+		t.Fatalf("expected 'egress:web:snapshot:chan9', got %q", got)
+	}
+}
+
 func TestTTL(t *testing.T) {
 	rq := NewRedisQueue("localhost:6379", "", 0, 120, "")
 	if rq.TTL().Seconds() != 120 {
 		t.Fatalf("expected TTL 120s, got %v", rq.TTL())
+	}
+}
+
+func TestTTL_ZeroValue(t *testing.T) {
+	rq := NewRedisQueue("localhost:6379", "", 0, 0, "")
+	if rq.TTL().Seconds() != 0 {
+		t.Fatalf("expected TTL 0s, got %v", rq.TTL())
 	}
 }
