@@ -486,15 +486,21 @@ verify_multi_panel_vlm() {
         return 0
     fi
 
-    # Check up to 3 mid frames (spread evenly)
+    # Check up to 3 mid frames, skipping early ones (stream join latency
+    # means early frames may only show 1 user before the 2nd stream appears)
     local check_frames=()
     local total=${#mid_frames[@]}
     if [ "$total" -le 3 ]; then
         check_frames=("${mid_frames[@]}")
+    elif [ "$total" -le 5 ]; then
+        # Pick last 3 mid frames
+        check_frames+=("${mid_frames[$((total - 3))]}")
+        check_frames+=("${mid_frames[$((total - 2))]}")
+        check_frames+=("${mid_frames[$((total - 1))]}")
     else
-        # Pick first, middle, last of mid frames
-        check_frames+=("${mid_frames[0]}")
+        # Pick from second half: 50%, 75%, last
         check_frames+=("${mid_frames[$((total / 2))]}")
+        check_frames+=("${mid_frames[$((total * 3 / 4))]}")
         check_frames+=("${mid_frames[$((total - 1))]}")
     fi
 
