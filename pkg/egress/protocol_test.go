@@ -201,6 +201,77 @@ func TestBuildUDSMessageFromQueueTaskDefaultInterval(t *testing.T) {
 	}
 }
 
+func TestBuildUDSMessageVideoDecodeMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  map[string]interface{}
+		expected int
+	}{
+		{
+			name: "explicit ffmpeg",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(1),
+			},
+			expected: 1,
+		},
+		{
+			name: "explicit passthrough",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(0),
+			},
+			expected: 0,
+		},
+		{
+			name: "explicit sdk",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+				"videoDecodeMode": float64(2),
+			},
+			expected: 2,
+		},
+		{
+			name: "default is auto",
+			payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			},
+			expected: -1, // default to auto (C++ decides based on user count)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := &queue.Task{
+				ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+				Payload: tt.payload,
+			}
+			msg, err := buildUDSMessageFromQueueTask(task)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if msg.VideoDecodeMode != tt.expected {
+				t.Fatalf("expected videoDecodeMode %d, got %d", tt.expected, msg.VideoDecodeMode)
+			}
+		})
+	}
+}
+
+func TestValidateUDSMessage_InvalidVideoDecodeMode(t *testing.T) {
+	msg := &UDSMessage{
+		Cmd: "record", Action: "start", Layout: "flat",
+		Channel: "demo", AccessToken: "token-123456", WorkerUid: 42,
+		VideoDecodeMode: 5,
+	}
+	err := ValidateUDSMessage(msg)
+	if err == nil {
+		t.Fatal("expected error for invalid videoDecodeMode")
+	}
+	if !strings.Contains(err.Error(), "videoDecodeMode") {
+		t.Fatalf("expected error about videoDecodeMode, got: %v", err)
+	}
+}
+
 func TestBuildUDSMessageFromQueueTaskNilTask(t *testing.T) {
 	_, err := buildUDSMessageFromQueueTask(nil)
 	if err == nil {
@@ -208,5 +279,266 @@ func TestBuildUDSMessageFromQueueTaskNilTask(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "task cannot be nil") {
 		t.Fatalf("expected nil task error, got %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskUsersAsSingleString(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			"users": "single-user",
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msg.Uid) != 1 || msg.Uid[0] != "single-user" {
+		t.Fatalf("expected uid [single-user], got %#v", msg.Uid)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskEmptyUsersString(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			"users": "",
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msg.Uid) != 0 {
+		t.Fatalf("expected empty uid slice for empty string, got %#v", msg.Uid)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskFreestyleLayout(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			"layout":             "freestyle",
+			"freestyleCanvasUrl": "https://example.com/canvas",
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.Layout != "freestyle" {
+		t.Fatalf("expected freestyle layout, got %s", msg.Layout)
+	}
+	if msg.FreestyleCanvasUrl != "https://example.com/canvas" {
+		t.Fatalf("expected canvas URL, got %s", msg.FreestyleCanvasUrl)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskDefaultLayoutIsFlat(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.Layout != "flat" {
+		t.Fatalf("expected default layout flat, got %s", msg.Layout)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskEmptyLayoutDefaultsFlat(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			"layout": "",
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.Layout != "flat" {
+		t.Fatalf("expected default layout flat for empty string, got %s", msg.Layout)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskStartMissingWorkerUid(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel":      "demo",
+			"access_token": "token-123456",
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for missing workerUid on start")
+	}
+	if !strings.Contains(err.Error(), "workerUid") {
+		t.Fatalf("expected error about workerUid, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskStartMissingChannel(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start",
+		Payload: map[string]interface{}{
+			"access_token": "token-123456",
+			"workerUid":    float64(42),
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for missing channel on start")
+	}
+	if !strings.Contains(err.Error(), "channel") {
+		t.Fatalf("expected error about channel, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskChannelMustBeString(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel":      float64(123),
+			"access_token": "token-123456",
+			"workerUid":    float64(42),
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for non-string channel")
+	}
+	if !strings.Contains(err.Error(), "channel must be a string") {
+		t.Fatalf("expected 'channel must be a string' error, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskWorkerUidInt64(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456",
+			"workerUid": int64(99),
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.WorkerUid != 99 {
+		t.Fatalf("expected worker UID 99, got %d", msg.WorkerUid)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskWorkerUidInt(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456",
+			"workerUid": int(88),
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.WorkerUid != 88 {
+		t.Fatalf("expected worker UID 88, got %d", msg.WorkerUid)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskWorkerUidInvalidType(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456",
+			"workerUid": "not-a-number",
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for string workerUid")
+	}
+	if !strings.Contains(err.Error(), "workerUid must be a number") {
+		t.Fatalf("expected 'workerUid must be a number' error, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskIntervalInvalidType(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel": "demo", "access_token": "token-123456",
+			"workerUid":      float64(42),
+			"interval_in_ms": "not-a-number",
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for string interval_in_ms")
+	}
+	if !strings.Contains(err.Error(), "interval_in_ms must be a number") {
+		t.Fatalf("expected interval_in_ms error, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskAccessTokenMustBeString(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "start", Channel: "demo",
+		Payload: map[string]interface{}{
+			"channel":      "demo",
+			"access_token": float64(12345),
+			"workerUid":    float64(42),
+		},
+	}
+	_, err := buildUDSMessageFromQueueTask(task)
+	if err == nil {
+		t.Fatal("expected error for non-string access_token")
+	}
+	if !strings.Contains(err.Error(), "access_token must be a string") {
+		t.Fatalf("expected 'access_token must be a string' error, got: %v", err)
+	}
+}
+
+func TestBuildUDSMessageFromQueueTaskCanvasUrlTrimmed(t *testing.T) {
+	task := &queue.Task{
+		ID: "test1", Cmd: "record", Action: "stop", Channel: "demo",
+		Payload: map[string]interface{}{
+			"freestyleCanvasUrl": "  https://example.com/canvas  ",
+		},
+	}
+	msg, err := buildUDSMessageFromQueueTask(task)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.FreestyleCanvasUrl != "https://example.com/canvas" {
+		t.Fatalf("expected trimmed canvas URL, got %q", msg.FreestyleCanvasUrl)
+	}
+}
+
+func TestBuildUDSMessageAllCmdTypes(t *testing.T) {
+	for _, cmd := range []string{"snapshot", "record", "rtmp", "whip"} {
+		task := &queue.Task{
+			ID: "test1", Cmd: cmd, Action: "start", Channel: "demo",
+			Payload: map[string]interface{}{
+				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
+			},
+		}
+		msg, err := buildUDSMessageFromQueueTask(task)
+		if err != nil {
+			t.Fatalf("cmd %q: unexpected error: %v", cmd, err)
+		}
+		if msg.Cmd != cmd {
+			t.Fatalf("expected cmd %q, got %q", cmd, msg.Cmd)
+		}
 	}
 }

@@ -32,7 +32,7 @@ snapshots:
   width: 1280                # Video width
   height: 720                # Video height
   users: ""                  # target user list, if multiple users, use comma to separate
-  layout: "flat"             # Recording layout: "grid" or "flat" or "spotlight" or "freestyle" or "customized-layout"
+  layout: "flat"             # Recording layout: "flat", "spotlight", "customized", or "freestyle"
   interval_in_ms: 20000      # Save frame every 20 seconds
   quality: 90                # Picture quality(0 for AUTO, 1-100)
 
@@ -40,7 +40,7 @@ snapshots:
 recording:
   output_dir: "./recordings"   # Where to store recordings
   users: ""                    # target user list, if multiple users, use comma to separate
-  layout: "flat"               # Recording layout: "grid" or "flat" or "spotlight" or "freestyle" or "customized-layout"
+  layout: "flat"               # Recording layout: "flat", "spotlight", "customized", or "freestyle"
   format: "ts"                 # Output format: "mp4", "avi", "mkv", "ts"
   max_duration_seconds: 86400  # Maximum recording duration (1 day)
 

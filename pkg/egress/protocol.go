@@ -14,13 +14,14 @@ type UDSMessage struct {
 	TaskID             string   `json:"task_id"`            // Task ID for tracking completion
 	Cmd                string   `json:"cmd"`                // "snapshot", "record", "rtmp", or "whip"
 	Action             string   `json:"action"`             // "start", "stop", "status"
-	Layout             string   `json:"layout"`             // "grid", "flat", "spotlight", or "freestyle"
+	Layout             string   `json:"layout"`             // "flat", "spotlight", "customized", or "freestyle"
 	FreestyleCanvasUrl string   `json:"freestyleCanvasUrl"` // URL for custom canvas, used if layout is "freestyle"
 	Uid                []string `json:"uid"`                // User IDs, if empty, all users will be included
 	Channel            string   `json:"channel"`            // Channel Name
 	AccessToken        string   `json:"access_token"`       // Access token for authentication
 	WorkerUid          int      `json:"workerUid"`          // Worker UID
 	IntervalInMs       int      `json:"interval_in_ms"`     // Interval in milliseconds
+	VideoDecodeMode    int      `json:"videoDecodeMode"`    // -1=auto(default), 0=passthrough, 1=ffmpeg, 2=sdk
 }
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager
@@ -140,6 +141,19 @@ func buildUDSMessageFromQueueTask(task *queue.Task) (*UDSMessage, error) {
 		udsMsg.IntervalInMs = 20000
 	}
 
+	// VideoDecodeMode (optional, -1=auto: single user→passthrough, multi→ffmpeg)
+	udsMsg.VideoDecodeMode = -1 // default: auto-detect based on user count
+	if decodeModeVal, ok := payload["videoDecodeMode"]; ok {
+		switch v := decodeModeVal.(type) {
+		case float64:
+			udsMsg.VideoDecodeMode = int(v)
+		case int:
+			udsMsg.VideoDecodeMode = v
+		case int64:
+			udsMsg.VideoDecodeMode = int(v)
+		}
+	}
+
 	// TaskID override for stop/status payloads
 	if taskIDVal, ok := payload["task_id"]; ok {
 		if taskIDStr, isStr := taskIDVal.(string); isStr && taskIDStr != "" {
@@ -170,9 +184,9 @@ func ValidateUDSMessage(msg *UDSMessage) error {
 	}
 
 	// Validate layout
-	validLayouts := map[string]bool{"flat": true, "grid": true, "spotlight": true, "freestyle": true}
+	validLayouts := map[string]bool{"flat": true, "spotlight": true, "customized": true, "freestyle": true}
 	if !validLayouts[msg.Layout] {
-		return fmt.Errorf("layout %s is not supported, only flat, grid, spotlight, and freestyle are supported", msg.Layout)
+		return fmt.Errorf("layout %s is not supported, only flat, spotlight, customized, and freestyle are supported", msg.Layout)
 	}
 
 	// Validate freestyleCanvasUrl if present
@@ -207,6 +221,11 @@ func ValidateUDSMessage(msg *UDSMessage) error {
 		}
 	}
 	// Stop and status actions don't require these fields - they use task_id for identification
+
+	// Validate videoDecodeMode (-1=auto, 0=passthrough, 1=ffmpeg, 2=sdk)
+	if msg.VideoDecodeMode < -1 || msg.VideoDecodeMode > 2 {
+		return fmt.Errorf("videoDecodeMode must be -1 (auto), 0 (passthrough), 1 (ffmpeg), or 2 (sdk)")
+	}
 
 	return nil
 }
@@ -290,8 +309,12 @@ func ValidateStartTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 
-	// Validate uid array elements
-	if uidVal, ok := payload["uid"]; ok && uidVal != nil {
+	// Validate users array elements (API uses "users" field, mapped to uid in UDS message)
+	uidVal := payload["users"]
+	if uidVal == nil {
+		uidVal = payload["uid"] // fallback for backwards compatibility
+	}
+	if uidVal != nil {
 		switch v := uidVal.(type) {
 		case []string:
 			for i, uid := range v {
@@ -466,9 +489,9 @@ func validateTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 	payload["layout"] = layoutStr
-	validLayouts := map[string]bool{"flat": true, "grid": true, "spotlight": true, "freestyle": true}
+	validLayouts := map[string]bool{"flat": true, "spotlight": true, "customized": true, "freestyle": true}
 	if !validLayouts[layoutStr] {
-		return fmt.Errorf("layout %s not supported, only flat, grid, spotlight, and freestyle are supported", layoutStr)
+		return fmt.Errorf("layout %s not supported, only flat, spotlight, customized, and freestyle are supported", layoutStr)
 	}
 	// Validate freestyleCanvasUrl (optional, only if present and non-empty)
 	canvasVal, ok := payload["freestyleCanvasUrl"]
@@ -489,9 +512,13 @@ func validateTaskRequest(taskReq *TaskRequest) error {
 		}
 	}
 	// Validate user count (optional, only if present and non-empty)
-	uidVal, ok := payload["uid"]
-	if ok && uidVal != nil {
-		switch v := uidVal.(type) {
+	// API uses "users" field; fall back to "uid" for backwards compatibility
+	usersVal, usersOk := payload["users"]
+	if !usersOk || usersVal == nil {
+		usersVal, usersOk = payload["uid"]
+	}
+	if usersOk && usersVal != nil {
+		switch v := usersVal.(type) {
 		case []string:
 			if len(v) > 32 {
 				return fmt.Errorf("users must be at most 32")

@@ -102,6 +102,16 @@ void TaskPipe::start(agora::rtc::RtcClient& rtc_client, agora::rtc::SnapshotSink
             this->handleSdkError(errorType, errorMessage);
         });
 
+    // Setup encoded video frame callback for passthrough mode
+    rtc_client_->setEncodedVideoFrameCallback(
+        [this](uint32_t uid, const uint8_t* data, size_t length,
+               const agora::rtc::EncodedVideoFrameInfo& info) {
+            bool has_active_recording = hasActiveTasksOfType("record");
+            if (has_active_recording && recording_sink_) {
+                recording_sink_->onEncodedVideoFrame(uid, data, length, info);
+            }
+        });
+
     // Setup frame callbacks
     rtc_client_->setVideoFrameCallback([this](const agora::media::base::VideoFrame& frame,
                                               const std::string& userId) {
@@ -318,15 +328,62 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
             return;
         }
 
-        // Ensure we're connected to the channel
+        // Update configs with channel and task information
+        recording_config_.channel = msg.channel;
+        recording_config_.taskId = msg.task_id;
+
+        // Set recording mode and target users from API request
+        recording_config_.targetUsers = msg.uid;
+        if (msg.uid.size() == 1) {
+            recording_config_.mode = agora::rtc::VideoCompositor::Mode::Individual;
+            logInfo("Individual recording mode (single user: " + msg.uid[0] + ")", instance_id_);
+        } else {
+            recording_config_.mode = agora::rtc::VideoCompositor::Mode::Composite;
+            logInfo("Composite recording mode (" + std::to_string(msg.uid.size()) + " users)",
+                    instance_id_);
+        }
+
+        // Determine video decode mode
+        // -1 = auto: single user → passthrough, multiple users → ffmpeg
+        bool isIndividual = (msg.uid.size() == 1);
+        int resolvedMode = msg.videoDecodeMode;
+        if (resolvedMode == -1) {
+            resolvedMode = isIndividual ? 0 : 1;  // auto: passthrough for single, ffmpeg for multi
+            logInfo("Auto decode mode: " + std::string(isIndividual ? "passthrough" : "ffmpeg"),
+                    instance_id_);
+        }
+
+        agora::rtc::VideoDecodeMode decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+        if (resolvedMode == 0) {
+            decodeMode = agora::rtc::VideoDecodeMode::Passthrough;
+        } else if (resolvedMode == 2) {
+            decodeMode = agora::rtc::VideoDecodeMode::SdkDecode;
+        }
+
+        // Passthrough only works with individual mode
+        if (decodeMode == agora::rtc::VideoDecodeMode::Passthrough && !isIndividual) {
+            logInfo("Passthrough not supported with composite mode, falling back to ffmpeg",
+                    instance_id_);
+            decodeMode = agora::rtc::VideoDecodeMode::FfmpegDecode;
+            resolvedMode = 1;
+        }
+
+        // Set decode mode BEFORE connecting so observers are registered correctly
+        rtc_client_->config().videoDecodeMode = decodeMode;
+        recording_config_.videoDecodeMode = resolvedMode;
+        logInfo(
+            "Video decode mode: " + std::to_string(resolvedMode) + " (" +
+                (decodeMode == agora::rtc::VideoDecodeMode::Passthrough
+                     ? "passthrough"
+                     : (decodeMode == agora::rtc::VideoDecodeMode::SdkDecode ? "sdk" : "ffmpeg")) +
+                ")",
+            instance_id_);
+
+        // Connect to channel (uses decode mode set above for observer registration)
         if (!ensureConnected(msg.channel, msg.access_token)) {
             logError("Failed to connect to channel: " + msg.channel, instance_id_);
             return;
         }
-
-        // Update configs with channel and task information
-        recording_config_.channel = msg.channel;
-        recording_config_.taskId = msg.task_id;
 
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = channel_states_[msg.channel];
@@ -491,7 +548,9 @@ bool TaskPipe::ensureConnected(const std::string& channel, const std::string& to
     auto& state = channel_states_[channel];
 
     if (!state.is_connected) {
-        logInfo("Connecting to channel: " + channel, instance_id_);
+        logInfo("Connecting to channel: " + channel + " (decode mode: " +
+                    std::to_string(static_cast<int>(rtc_client_->config().videoDecodeMode)) + ")",
+                instance_id_);
 
         rtc_client_->setChannel(channel);
         if (!token.empty()) {
@@ -507,6 +566,11 @@ bool TaskPipe::ensureConnected(const std::string& channel, const std::string& to
         }
 
         state.is_connected = true;
+    } else {
+        // Already connected — decode mode and observers were set during initial connect.
+        // Workers are single-use, so this typically means snapshot + recording share a channel.
+        logInfo("Channel " + channel + " already connected, reusing existing connection",
+                instance_id_);
     }
 
     logDebug("Channel " + channel + " task count: " + std::to_string(state.active_tasks.size()),

@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 
+#include "encoded_frame_decoder.h"
 #include "layout_detector.h"
 #include "snapshot_encoder.h"
 #include "video_compositor.h"
@@ -45,6 +46,12 @@ class TaskConnectionObserver;
 }
 
 namespace rtc {
+
+// Video decode mode selection:
+// - ffmpeg_decode:  Receive encoded H264 from SDK, decode with our ffmpeg (default, safe)
+// - sdk_decode:     Let SDK decode internally (crash risk with mixed pixel formats)
+// - passthrough:    Write encoded H264 directly to container (individual recording only)
+enum class VideoDecodeMode { FfmpegDecode, SdkDecode, Passthrough };
 
 struct AgoraServiceDeleter {
     void operator()(agora::base::IAgoraService* ptr) const {
@@ -71,12 +78,18 @@ class RtcClient {
         int audioPlaybackSampleRate = 16000;
         int audioPlaybackChannels = 1;
         int audioPlaybackSamplesPerCall = 160;  // 16000 / 100 = 160 samples per 10ms frame
+
+        // Video decode mode (controlled by VIDEO_DECODE_MODE env var)
+        VideoDecodeMode videoDecodeMode = VideoDecodeMode::FfmpegDecode;
     };
 
     using VideoFrameCallback =
         std::function<void(const agora::media::base::VideoFrame&, const std::string& userId)>;
     using AudioFrameCallback = std::function<void(
         const agora::media::IAudioFrameObserverBase::AudioFrame&, const std::string& userId)>;
+    using EncodedVideoFrameCallback =
+        std::function<void(uint32_t uid, const uint8_t* data, size_t length,
+                           const agora::rtc::EncodedVideoFrameInfo& info)>;
     using SdkErrorCallback =
         std::function<void(const std::string& errorType, const std::string& errorMessage)>;
 
@@ -95,12 +108,20 @@ class RtcClient {
         videoFrameCallback_ = std::move(callback);
     }
 
+    void setEncodedVideoFrameCallback(EncodedVideoFrameCallback callback) {
+        encodedVideoFrameCallback_ = std::move(callback);
+    }
+
     void setAudioFrameCallback(AudioFrameCallback callback) {
         audioFrameCallback_ = std::move(callback);
     }
 
     void setSdkErrorCallback(SdkErrorCallback callback) {
         sdkErrorCallback_ = std::move(callback);
+    }
+
+    Config& config() {
+        return config_;
     }
 
     void setChannel(const std::string& channel) {
@@ -127,6 +148,26 @@ class RtcClient {
 
        private:
         VideoFrameCallback callback_;
+    };
+
+    // Simple observer that forwards raw encoded H264 data without decoding (passthrough mode)
+    class EncodedFrameForwarder : public agora::media::IVideoEncodedFrameObserver {
+       public:
+        explicit EncodedFrameForwarder(EncodedVideoFrameCallback callback)
+            : callback_(std::move(callback)) {}
+        virtual ~EncodedFrameForwarder() = default;
+
+        bool onEncodedVideoFrameReceived(
+            agora::rtc::uid_t uid, const uint8_t* imageBuffer, size_t length,
+            const agora::rtc::EncodedVideoFrameInfo& videoEncodedFrameInfo) override {
+            if (callback_ && imageBuffer && length > 0) {
+                callback_(uid, imageBuffer, length, videoEncodedFrameInfo);
+            }
+            return true;
+        }
+
+       private:
+        EncodedVideoFrameCallback callback_;
     };
 
     class AudioFrameObserver
@@ -225,6 +266,7 @@ class RtcClient {
     bool initialized_ = false;
     std::atomic<bool> connected_{false};
     VideoFrameCallback videoFrameCallback_;
+    EncodedVideoFrameCallback encodedVideoFrameCallback_;
     AudioFrameCallback audioFrameCallback_;
     SdkErrorCallback sdkErrorCallback_;
 
@@ -235,6 +277,8 @@ class RtcClient {
     agora::agora_refptr<agora::rtc::IVideoMixerSource> videoMixer_;
     agora::agora_refptr<agora::rtc::ILocalVideoTrack> videoTrack_;
     agora::agora_refptr<YuvFrameObserver> frameObserver_;
+    std::unique_ptr<EncodedFrameDecoder> encodedFrameObserver_;
+    std::unique_ptr<EncodedFrameForwarder> encodedFrameForwarder_;
     agora::agora_refptr<AudioFrameObserver> audioObserver_;
 
     // Forward declaration for TaskConnectionObserver from agora::egress namespace

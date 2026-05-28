@@ -356,10 +356,10 @@ std::string MetadataManager::layoutToString(Layout layout) {
             return "flat";
         case Layout::Spotlight:
             return "spotlight";
-        case Layout::Freestyle:
-            return "freestyle";
         case Layout::Customized:
             return "customized";
+        case Layout::Freestyle:
+            return "freestyle";
         default:
             return "flat";
     }
@@ -368,8 +368,8 @@ std::string MetadataManager::layoutToString(Layout layout) {
 MetadataManager::Layout MetadataManager::stringToLayout(const std::string& str) {
     if (str == "flat" || str == "Flat") return Layout::Flat;
     if (str == "spotlight" || str == "Spotlight") return Layout::Spotlight;
-    if (str == "freestyle" || str == "Freestyle") return Layout::Freestyle;
     if (str == "customized" || str == "Customized") return Layout::Customized;
+    if (str == "freestyle" || str == "Freestyle") return Layout::Freestyle;
     return Layout::Flat;  // Default
 }
 

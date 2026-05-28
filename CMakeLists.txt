@@ -63,6 +63,7 @@ message(STATUS "  FDKAAC: ${LIB_AGORA_FDKAAC}")
 
 add_library(snapshot_sink SHARED
     src/rtc_client.cpp
+    src/encoded_frame_decoder.cpp
     src/snapshot_sink.cpp
     src/recording_sink.cpp
     src/ts_segment_manager.cpp

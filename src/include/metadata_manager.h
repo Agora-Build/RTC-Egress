@@ -17,7 +17,7 @@ class MetadataManager {
    public:
     enum class FileType { JPEG, MP4, TS, M3U8 };
     enum class CompositionMode { Individual, Composite };
-    enum class Layout { Flat, Spotlight, Freestyle, Customized };
+    enum class Layout { Flat, Spotlight, Customized, Freestyle };
 
     struct FileInfo {
         std::string filename;
