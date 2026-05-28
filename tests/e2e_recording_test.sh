@@ -21,10 +21,13 @@
 #
 # Environment variables:
 #   STREAM_TOOL    - Path to stream-to-agora binary
-#   TEST_VIDEO     - Path to test video file (H264)
 #   APP_ID         - Agora App ID (defaults to test app)
 #   RECORD_SECONDS - How long to record each test (default: 15)
 #   TOKEN_EXPIRE   - Token expiry in seconds (default: 3600)
+#   VLM_URL        - VLM endpoint for content verification (optional)
+#                    e.g. http://192.168.0.48:8001/v1/chat/completions
+#   E2E_OUTPUT_DIR - Directory for browsable test outputs (default: /tmp/e2e_recording_output)
+#   SERV_PORT      - Port for atem file server (default: 8199)
 
 set -uo pipefail
 
@@ -34,14 +37,18 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$PROJECT_DIR/bin"
 CONFIG_DIR="$PROJECT_DIR/config"
 RECORD_DIR="$PROJECT_DIR/recordings"
-LOG_DIR="/tmp/e2e_recording_test"
+FIXTURES_DIR="$PROJECT_DIR/tests/fixtures"
 
 APP_ID="${APP_ID:-2655d20a82fc47cebcff82d5bd5d53ef}"
 CHANNEL="${CHANNEL:-e2e_rec_test_$(date +%s)}"
 RECORD_SECONDS="${RECORD_SECONDS:-15}"
 TOKEN_EXPIRE="${TOKEN_EXPIRE:-3600}"
 STREAM_TOOL="${STREAM_TOOL:-}"
-TEST_VIDEO="${TEST_VIDEO:-}"
+VLM_URL="${VLM_URL:-}"
+VLM_MODEL="${VLM_MODEL:-qwen2.5-vl-7b}"
+E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-/tmp/e2e_recording_output}"
+SERV_PORT="${SERV_PORT:-8199}"
+LOG_DIR="$E2E_OUTPUT_DIR/logs"
 
 SKIP_SDK=false
 KEEP_FILES=false
@@ -58,6 +65,7 @@ SERVICE_PIDS=()
 PASS=0
 FAIL=0
 SKIP=0
+TEST_SEQ=0
 RESULTS=()
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -98,8 +106,12 @@ cleanup() {
     done
     wait 2>/dev/null || true
 
+    # Stop the file server
+    atem serv kill "files-${SERV_PORT}" 2>/dev/null || true
+
     if [ "$KEEP_FILES" = false ]; then
         rm -f "$RECORD_DIR"/recording_*e2e_rec_test*.mp4 2>/dev/null || true
+        rm -rf "$E2E_OUTPUT_DIR" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -200,12 +212,243 @@ verify_recording() {
     return 0
 }
 
+# Send a single frame to VLM and check the response.
+# Returns 0 on pass/skip, 1 on content mismatch.
+vlm_check_frame() {
+    local frame_file="$1"
+    local tag="$2"          # e.g. "first_0", "last_4"
+    local user_count="$3"
+    local dest_dir="$4"
+    local seq_prefix="$5"
+
+    if [ ! -f "$frame_file" ] || [ "$(stat --printf='%s' "$frame_file" 2>/dev/null)" -lt 1000 ]; then
+        log "  VLM [$tag]: Frame not available, skipping"
+        return 0
+    fi
+
+    local prompt
+    if [ "$user_count" -eq 1 ]; then
+        prompt="Is this a single video scene (not split-screen or side-by-side)? Does it contain any visual content? Title cards, credits, text on black background, and fade transitions all count as valid content. Only a completely uniform solid color frame with nothing on it should be considered no content. Reply ONLY with a JSON object: {\"single_scene\": true/false, \"has_content\": true/false, \"description\": \"brief description\"}"
+    else
+        prompt="Does this image show multiple video panels side-by-side (split-screen or grid layout)? Does it contain any visual content? Title cards, credits, text on black background, and fade transitions all count as valid content. Only a completely uniform solid color frame with nothing on it should be considered no content. Reply ONLY with a JSON object: {\"multi_panel\": true/false, \"has_content\": true/false, \"description\": \"brief description\"}"
+    fi
+
+    local b64_file="/tmp/e2e_vlm_b64_$$.txt"
+    base64 -w0 "$frame_file" > "$b64_file"
+
+    local vlm_payload="/tmp/e2e_vlm_payload_$$.json"
+    python3 - "$VLM_MODEL" "$prompt" "$b64_file" "$vlm_payload" <<'PYEOF'
+import json, sys
+model, prompt, b64_path, out_path = sys.argv[1:5]
+with open(b64_path) as f:
+    b64 = f.read()
+msg = {
+    "model": model,
+    "max_tokens": 200,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+    ]}]
+}
+with open(out_path, "w") as f:
+    json.dump(msg, f)
+PYEOF
+    rm -f "$b64_file"
+
+    local vlm_response
+    vlm_response=$(curl -sf --max-time 30 "$VLM_URL" \
+        -H "Content-Type: application/json" \
+        -d @"$vlm_payload" 2>/dev/null) || {
+        rm -f "$vlm_payload"
+        log "  VLM [$tag]: Request failed, skipping"
+        return 0
+    }
+    rm -f "$vlm_payload"
+
+    local content
+    content=$(echo "$vlm_response" | python3 -c "
+import json, sys
+try:
+    r = json.load(sys.stdin)
+    print(r['choices'][0]['message']['content'])
+except:
+    print('')
+" 2>/dev/null)
+
+    if [ -z "$content" ]; then
+        log "  VLM [$tag]: Empty response, skipping"
+        return 0
+    fi
+
+    log "  VLM [$tag]: $content"
+    echo "$content" > "$dest_dir/${seq_prefix}_vlm_${tag}.txt" 2>/dev/null || true
+
+    # Parse VLM JSON response
+    local vlm_ok
+    if [ "$user_count" -eq 1 ]; then
+        vlm_ok=$(echo "$content" | python3 -c "
+import json, sys, re
+try:
+    text = sys.stdin.read()
+    m = re.search(r'\{[^}]+\}', text)
+    if m:
+        d = json.loads(m.group())
+        print('yes' if d.get('single_scene') and d.get('has_content') else 'no')
+    else:
+        print('unclear')
+except:
+    print('unclear')
+" 2>/dev/null)
+    else
+        vlm_ok=$(echo "$content" | python3 -c "
+import json, sys, re
+try:
+    text = sys.stdin.read()
+    m = re.search(r'\{[^}]+\}', text)
+    if m:
+        d = json.loads(m.group())
+        print('yes' if d.get('multi_panel') and d.get('has_content') else 'no')
+    else:
+        print('unclear')
+except:
+    print('unclear')
+" 2>/dev/null)
+    fi
+
+    case "$vlm_ok" in
+        yes) return 0 ;;
+        no)  return 1 ;;
+        *)   return 0 ;;  # unclear = non-fatal
+    esac
+}
+
+# Verify video content using a Vision Language Model (optional)
+# Checks all extracted frames (first 5, mid every 2s, last 5) for content correctness.
+verify_content_vlm() {
+    local file="$1"
+    local label="$2"
+    local user_count="$3"   # 1 = individual, 2+ = composite
+
+    if [ -z "$VLM_URL" ]; then
+        return 0  # skip silently when VLM not configured
+    fi
+
+    local seq_prefix
+    seq_prefix=$(printf "%02d" "$TEST_SEQ")
+    local safe_label
+    safe_label=$(echo "$label" | sed 's/[^a-zA-Z0-9_]/_/g' | sed 's/__*/_/g')
+    local dest_dir="$E2E_OUTPUT_DIR/${seq_prefix}_${safe_label}"
+
+    # Collect all extracted frame files in order
+    local frames=()
+    local f
+    for f in "$dest_dir/${seq_prefix}_frame_first_"*.jpg; do
+        [ -f "$f" ] && frames+=("$f")
+    done
+    for f in "$dest_dir/${seq_prefix}_frame_mid_"*.jpg; do
+        [ -f "$f" ] && frames+=("$f")
+    done
+    for f in "$dest_dir/${seq_prefix}_frame_last_"*.jpg; do
+        [ -f "$f" ] && frames+=("$f")
+    done
+
+    if [ ${#frames[@]} -eq 0 ]; then
+        log "  VLM: No frames to verify"
+        return 0
+    fi
+
+    local vlm_pass=0 vlm_fail=0 vlm_skip=0
+    for f in "${frames[@]}"; do
+        local tag
+        tag=$(basename "$f" .jpg | sed "s/^${seq_prefix}_frame_//")
+        if vlm_check_frame "$f" "$tag" "$user_count" "$dest_dir" "$seq_prefix"; then
+            vlm_pass=$((vlm_pass + 1))
+        else
+            vlm_fail=$((vlm_fail + 1))
+            log "  VLM FAIL: $tag"
+        fi
+    done
+
+    local total=$((vlm_pass + vlm_fail))
+    if [ "$vlm_fail" -gt 0 ]; then
+        fail "VLM content check: $label" "$vlm_fail/$total frames mismatched"
+        return 1
+    fi
+
+    pass "VLM content check: $label ($total frames verified)"
+    return 0
+}
+
+# Extract key frames from a recording into the output directory.
+# Produces: first 5 frames, last 5 frames, and one frame every 2 seconds in between.
+publish_output() {
+    local file="$1"
+    local label="$2"
+    TEST_SEQ=$((TEST_SEQ+1))
+    local seq_prefix
+    seq_prefix=$(printf "%02d" "$TEST_SEQ")
+    # Sanitize label into a directory-safe name
+    local safe_label
+    safe_label=$(echo "$label" | sed 's/[^a-zA-Z0-9_]/_/g' | sed 's/__*/_/g')
+    local dest_dir="$E2E_OUTPUT_DIR/${seq_prefix}_${safe_label}"
+    mkdir -p "$dest_dir"
+    cp "$file" "$dest_dir/" 2>/dev/null || true
+
+    # Get video metadata
+    local fps duration total_frames
+    fps=$(ffprobe -v quiet -select_streams v:0 \
+        -show_entries stream=r_frame_rate -of csv=p=0 "$file" 2>/dev/null || echo "25/1")
+    fps=$(python3 -c "print(int(round(eval('$fps'))))" 2>/dev/null || echo 25)
+    duration=$(ffprobe -v quiet -show_entries format=duration \
+        -of csv=p=0 "$file" 2>/dev/null || echo "0")
+    total_frames=$(python3 -c "print(int(float('${duration:-0}') * $fps))" 2>/dev/null || echo 0)
+
+    log "  Extracting frames: ${total_frames} total (${duration}s @ ${fps}fps)"
+
+    # First 5 frames
+    for i in 0 1 2 3 4; do
+        if [ "$i" -lt "$total_frames" ]; then
+            ffmpeg -v quiet -i "$file" -vf "select=eq(n\\,$i)" -frames:v 1 \
+                -q:v 2 "$dest_dir/${seq_prefix}_frame_first_${i}.jpg" -y 2>/dev/null || true
+        fi
+    done
+
+    # Every 2 seconds (skipping first/last 5 frames region)
+    local interval_frames=$((fps * 2))
+    local mid_start=5
+    local mid_end=$((total_frames - 5))
+    if [ "$interval_frames" -gt 0 ] && [ "$mid_end" -gt "$mid_start" ]; then
+        local fn="$mid_start"
+        local mid_idx=0
+        while [ "$fn" -lt "$mid_end" ]; do
+            local ts
+            ts=$(python3 -c "print(f'{$fn/$fps:.1f}s')" 2>/dev/null)
+            ffmpeg -v quiet -i "$file" -vf "select=eq(n\\,$fn)" -frames:v 1 \
+                -q:v 2 "$dest_dir/${seq_prefix}_frame_mid_${mid_idx}_${ts}.jpg" -y 2>/dev/null || true
+            fn=$((fn + interval_frames))
+            mid_idx=$((mid_idx + 1))
+        done
+    fi
+
+    # Last 5 frames
+    if [ "$total_frames" -gt 5 ]; then
+        for i in 4 3 2 1 0; do
+            local fn=$((total_frames - 1 - i))
+            if [ "$fn" -ge 0 ]; then
+                ffmpeg -v quiet -i "$file" -vf "select=eq(n\\,$fn)" -frames:v 1 \
+                    -q:v 2 "$dest_dir/${seq_prefix}_frame_last_${i}.jpg" -y 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
 # Submit a recording task and wait for it to record
 run_recording_test() {
     local label="$1"
     local users_json="$2"        # e.g. '["1001"]' or '["1001","1002"]'
     local decode_mode="$3"       # -1, 0, 1, or 2
-    local expect_video_codec="${4:-h264}"
+    local layout="${4:-flat}"    # flat, grid, spotlight, freestyle
+    local expect_video_codec="${5:-h264}"
 
     log "--- $label ---"
 
@@ -236,7 +479,7 @@ run_recording_test() {
     "access_token": "$worker_token",
     "workerUid": 42,
     "users": $users_json,
-    "layout": "flat",
+    "layout": "$layout",
     "videoDecodeMode": $decode_mode
   }
 }
@@ -291,11 +534,18 @@ ENDJSON
         return 1
     fi
 
+    # Determine user count for VLM verification
+    local user_count
+    user_count=$(echo "$users_json" | python3 -c "import json,sys; u=json.load(sys.stdin); print(len(u) if u else 2)" 2>/dev/null || echo "2")
+
     # Verify each output file
     local any_pass=false
     for f in $output_files; do
         if verify_recording "$f" "$label" "$expect_video_codec"; then
             any_pass=true
+            publish_output "$f" "$label"
+            # Run VLM content verification on the first passing file
+            verify_content_vlm "$f" "$label" "$user_count" || true
         fi
     done
 
@@ -333,27 +583,35 @@ if [ -z "$STREAM_TOOL" ]; then
 fi
 log "Using stream-to-agora: $STREAM_TOOL"
 
-# Find test video
-if [ -z "$TEST_VIDEO" ]; then
-    for candidate in \
-        /tmp/egress-test-compare/bigbuckbunny_360.m4v \
-        /tmp/egress-test-compare/video_a.mp4 \
-        /tmp/test_video.mp4; do
-        if [ -f "$candidate" ]; then
-            TEST_VIDEO="$candidate"
-            break
-        fi
-    done
-fi
+# ── Download test videos ──────────────────────────────────────────────────────
+# All videos must have both video (h264) and audio (aac) tracks.
+#   - Sintel trailer (4MB)  — dark fantasy animation, h264+aac
+#   - BBB trailer (11MB)    — colorful animal animation, h264+aac
+#   - Movie 300 (2.7MB)     — live action test clip, h264+aac
 
-if [ -z "$TEST_VIDEO" ] || [ ! -f "$TEST_VIDEO" ]; then
-    log "Downloading test video..."
-    TEST_VIDEO="/tmp/egress-test-compare/bigbuckbunny_360.m4v"
-    mkdir -p /tmp/egress-test-compare
-    curl -sL "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_640x360.m4v" \
-        -o "$TEST_VIDEO"
-fi
-log "Using test video: $TEST_VIDEO"
+mkdir -p "$FIXTURES_DIR"
+
+VIDEO_SINTEL="$FIXTURES_DIR/sintel_trailer.mp4"
+VIDEO_BBB="$FIXTURES_DIR/bbb_trailer.mp4"
+VIDEO_MOVIE="$FIXTURES_DIR/movie_300.mp4"
+
+declare -A VIDEO_URLS=(
+    ["$VIDEO_SINTEL"]="https://media.w3.org/2010/05/sintel/trailer.mp4"
+    ["$VIDEO_BBB"]="https://media.w3.org/2010/05/bunny/trailer.mp4"
+    ["$VIDEO_MOVIE"]="https://media.w3.org/2010/05/video/movie_300.mp4"
+)
+
+for vfile in "$VIDEO_SINTEL" "$VIDEO_BBB" "$VIDEO_MOVIE"; do
+    if [ ! -f "$vfile" ]; then
+        log "Downloading $(basename "$vfile") ..."
+        curl -sL "${VIDEO_URLS[$vfile]}" -o "$vfile" || {
+            log "ERROR: Failed to download $vfile"
+            exit 1
+        }
+    fi
+    local_info=$(ffprobe -v quiet -show_entries stream=codec_type,codec_name -of csv=p=0 "$vfile" 2>/dev/null | tr '\n' ' ')
+    log "Test video: $(basename "$vfile") [${local_info}] ($(numfmt --to=iec "$(stat --printf='%s' "$vfile")"))"
+done
 
 # Check binaries
 for bin in eg_worker egress api-server; do
@@ -380,13 +638,34 @@ done
 
 log "Channel: $CHANNEL"
 log "Record duration: ${RECORD_SECONDS}s per test"
+if [ -n "$VLM_URL" ]; then
+    if curl -sf --max-time 5 "${VLM_URL%/chat/completions}/models" >/dev/null 2>&1; then
+        log "VLM: $VLM_URL (model: $VLM_MODEL) - available"
+    else
+        log "VLM: $VLM_URL - NOT reachable, content checks will be skipped"
+        VLM_URL=""
+    fi
+else
+    log "VLM: not configured (set VLM_URL to enable content verification)"
+fi
 log ""
+
+# ── Backup previous results ───────────────────────────────────────────────────
+
+if [ -d "$E2E_OUTPUT_DIR" ] && [ "$(ls -A "$E2E_OUTPUT_DIR" 2>/dev/null)" ]; then
+    backup_file="${E2E_OUTPUT_DIR}_$(date +%Y%m%d_%H%M%S).zip"
+    log "Backing up previous results to $backup_file ..."
+    zip -rq "$backup_file" "$E2E_OUTPUT_DIR" 2>/dev/null && \
+        log "Backup saved: $backup_file ($(numfmt --to=iec "$(stat --printf='%s' "$backup_file")"))" || \
+        log "WARNING: Backup failed (non-fatal)"
+    rm -rf "$E2E_OUTPUT_DIR"
+fi
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 mkdir -p "$LOG_DIR" "$RECORD_DIR"
 
-# Start streams (2 users)
+# Start streams (2 users with different videos for visual distinction)
 log "Starting video streams..."
 TOKEN_1001=$(generate_token "1001")
 TOKEN_1002=$(generate_token "1002")
@@ -396,14 +675,16 @@ if [ -z "$TOKEN_1001" ] || [ -z "$TOKEN_1002" ]; then
     exit 1
 fi
 
+log "  User 1001: $(basename "$VIDEO_BBB")"
 "$STREAM_TOOL" --app-id "$APP_ID" --channel "$CHANNEL" \
     --rtc-user-id 1001 --token "$TOKEN_1001" \
-    --loop "$TEST_VIDEO" > "$LOG_DIR/stream_1001.log" 2>&1 &
+    --loop "$VIDEO_BBB" > "$LOG_DIR/stream_1001.log" 2>&1 &
 STREAM_PIDS+=($!)
 
+log "  User 1002: $(basename "$VIDEO_SINTEL")"
 "$STREAM_TOOL" --app-id "$APP_ID" --channel "$CHANNEL" \
     --rtc-user-id 1002 --token "$TOKEN_1002" \
-    --loop "$TEST_VIDEO" > "$LOG_DIR/stream_1002.log" 2>&1 &
+    --loop "$VIDEO_SINTEL" > "$LOG_DIR/stream_1002.log" 2>&1 &
 STREAM_PIDS+=($!)
 
 # Wait for streams to connect
@@ -477,98 +758,274 @@ restart_egress() {
     log "Egress restarted (PID $new_pid)"
 }
 
+# ── File server for browsing test outputs ────────────────────────────────────
+
+mkdir -p "$E2E_OUTPUT_DIR"
+atem serv files "$E2E_OUTPUT_DIR" --port "$SERV_PORT" --no-browser --background 2>/dev/null && \
+    log "File server started: https://localhost:${SERV_PORT}  (browse test outputs)" || \
+    log "File server failed to start (non-fatal, outputs still saved to $E2E_OUTPUT_DIR)"
+
 # ── Test Cases ────────────────────────────────────────────────────────────────
 # NOTE: Each test restarts the egress service because workers are single-use.
 # A worker process handles one task then exits; the manager currently does not
 # respawn dead workers mid-session.
 
-log "==== SINGLE USER TESTS ===="
+# ── Helper: restart streams with different videos ────────────────────────────
+
+restart_streams() {
+    local video_1001="$1"
+    local video_1002="$2"
+    log "Restarting streams: 1001=$(basename "$video_1001") 1002=$(basename "$video_1002")"
+    # Kill existing streams
+    for pid in "${STREAM_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    for pid in "${STREAM_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    STREAM_PIDS=()
+
+    local t1 t2
+    t1=$(generate_token "1001")
+    t2=$(generate_token "1002")
+    "$STREAM_TOOL" --app-id "$APP_ID" --channel "$CHANNEL" \
+        --rtc-user-id 1001 --token "$t1" \
+        --loop "$video_1001" > "$LOG_DIR/stream_1001.log" 2>&1 &
+    STREAM_PIDS+=($!)
+    "$STREAM_TOOL" --app-id "$APP_ID" --channel "$CHANNEL" \
+        --rtc-user-id 1002 --token "$t2" \
+        --loop "$video_1002" > "$LOG_DIR/stream_1002.log" 2>&1 &
+    STREAM_PIDS+=($!)
+    sleep 5
+    for uid in 1001 1002; do
+        if ! grep -q "ready" "$LOG_DIR/stream_${uid}.log" 2>/dev/null; then
+            log "  WARNING: Stream $uid may not be ready"
+        fi
+    done
+}
+
+# ==============================================================================
+# PART 1: INDIVIDUAL MODE (single user recording)
+# users=["1001"] → Individual mode, only records user 1001, ignores new joiners
+# Streams: 1001=BBB(h264), 1002=Sintel(h264) — but only 1001 is recorded
+# ==============================================================================
+
+log "==== PART 1: INDIVIDUAL MODE (1 user) ===="
 log ""
 
-# Test 1: Single user, auto decode mode (should auto-select passthrough)
+# -- All decode modes × flat layout --
+log "---- Individual / flat / all decode modes ----"
+log ""
+
 run_recording_test \
-    "Single user / auto decode (expect passthrough)" \
-    '["1001"]' \
-    -1 \
-    "h264"
+    "individual / flat / auto (expect passthrough)" \
+    '["1001"]' -1 "flat" "h264"
 restart_egress
 
-# Test 2: Single user, explicit passthrough
 run_recording_test \
-    "Single user / passthrough" \
-    '["1001"]' \
-    0 \
-    "h264"
+    "individual / flat / passthrough" \
+    '["1001"]' 0 "flat" "h264"
 restart_egress
 
-# Test 3: Single user, explicit ffmpeg
 run_recording_test \
-    "Single user / ffmpeg decode" \
-    '["1001"]' \
-    1 \
-    "h264"
+    "individual / flat / ffmpeg" \
+    '["1001"]' 1 "flat" "h264"
 restart_egress
 
-# Test 4: Single user, sdk decode (known crash in SDK v4.4.32)
 if [ "$SKIP_SDK" = true ]; then
-    skip "Single user / sdk decode" "Skipped (--quick flag, known SDK v4.4.32 crash)"
+    skip "individual / flat / sdk" "Skipped (--quick, known SDK crash)"
 else
-    log "  NOTE: SDK decode mode crashes in Agora SDK v4.4.32 - expecting failure"
     run_recording_test \
-        "Single user / sdk decode" \
-        '["1001"]' \
-        2 \
-        "h264" || true
+        "individual / flat / sdk" \
+        '["1001"]' 2 "flat" "h264" || true
     restart_egress
 fi
 
+# -- All layouts × auto decode --
 log ""
-log "==== MULTI USER TESTS ===="
+log "---- Individual / all layouts / auto decode ----"
 log ""
 
-# Test 5: Multi user, auto decode mode (should auto-select ffmpeg)
-run_recording_test \
-    "Multi user / auto decode (expect ffmpeg)" \
-    '["1001","1002"]' \
-    -1 \
-    "h264"
-restart_egress
-
-# Test 6: Multi user, explicit ffmpeg
-run_recording_test \
-    "Multi user / ffmpeg decode" \
-    '["1001","1002"]' \
-    1 \
-    "h264"
-restart_egress
-
-# Test 7: Multi user, passthrough (should fall back to ffmpeg)
-run_recording_test \
-    "Multi user / passthrough (expect fallback to ffmpeg)" \
-    '["1001","1002"]' \
-    0 \
-    "h264"
-restart_egress
-
-# Test 8: Multi user, sdk decode
-if [ "$SKIP_SDK" = true ]; then
-    skip "Multi user / sdk decode" "Skipped (--quick flag, known SDK v4.4.32 crash)"
-else
-    log "  NOTE: SDK decode mode crashes in Agora SDK v4.4.32 - expecting failure"
+for layout in grid spotlight freestyle; do
     run_recording_test \
-        "Multi user / sdk decode" \
-        '["1001","1002"]' \
-        2 \
-        "h264" || true
+        "individual / $layout / auto" \
+        '["1001"]' -1 "$layout" "h264"
+    restart_egress
+done
+
+# -- Individual recording user 1002 (Sintel content) --
+log ""
+log "---- Individual / record user 1002 (Sintel) ----"
+log ""
+
+run_recording_test \
+    "individual(1002) / flat / passthrough" \
+    '["1002"]' 0 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "individual(1002) / flat / ffmpeg" \
+    '["1002"]' 1 "flat" "h264"
+restart_egress
+
+# ==============================================================================
+# PART 2: COMPOSITE MODE (multi user recording)
+# users=["1001","1002"] → Composite mode, records both users in layout
+# Streams: 1001=BBB(h264), 1002=Sintel(h264)
+# ==============================================================================
+
+log ""
+log "==== PART 2: COMPOSITE MODE (2 users) ===="
+log ""
+
+# -- All decode modes × flat layout --
+log "---- Composite / flat / all decode modes ----"
+log ""
+
+run_recording_test \
+    "composite / flat / auto (expect ffmpeg)" \
+    '["1001","1002"]' -1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / flat / ffmpeg" \
+    '["1001","1002"]' 1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / flat / passthrough (expect fallback)" \
+    '["1001","1002"]' 0 "flat" "h264"
+restart_egress
+
+if [ "$SKIP_SDK" = true ]; then
+    skip "composite / flat / sdk" "Skipped (--quick, known SDK crash)"
+else
+    run_recording_test \
+        "composite / flat / sdk" \
+        '["1001","1002"]' 2 "flat" "h264" || true
     restart_egress
 fi
 
-# Test 9: All users (empty list = composite all)
+# -- All layouts × auto decode --
+log ""
+log "---- Composite / all layouts / auto decode ----"
+log ""
+
+for layout in grid spotlight freestyle; do
+    run_recording_test \
+        "composite / $layout / auto" \
+        '["1001","1002"]' -1 "$layout" "h264"
+    restart_egress
+done
+
+# -- All layouts × ffmpeg decode (ensures layout rendering works with decode) --
+log ""
+log "---- Composite / all layouts / ffmpeg decode ----"
+log ""
+
+for layout in grid spotlight freestyle; do
+    run_recording_test \
+        "composite / $layout / ffmpeg" \
+        '["1001","1002"]' 1 "$layout" "h264"
+    restart_egress
+done
+
+# ==============================================================================
+# PART 3: COMPOSITE ALL (empty user list = record everyone in channel)
+# users=[] → records all users present, composite mode
+# ==============================================================================
+
+log ""
+log "==== PART 3: COMPOSITE ALL (empty user list) ===="
+log ""
+
+for layout in flat grid spotlight freestyle; do
+    run_recording_test \
+        "composite-all / $layout / auto" \
+        '[]' -1 "$layout" "h264"
+    restart_egress
+done
+
+# ==============================================================================
+# PART 4: DIFFERENT VIDEO SOURCES (Movie + Sintel)
+# Restart streams: 1001=Movie(live action), 1002=Sintel(animation)
+# Tests mixed content types — visually very different for VLM distinction.
+# ==============================================================================
+
+log ""
+log "==== PART 4: MIXED CONTENT (Movie + Sintel) ===="
+log ""
+
+restart_streams "$VIDEO_MOVIE" "$VIDEO_SINTEL"
+
+# -- Individual: record the live action user --
 run_recording_test \
-    "All users / auto decode (expect ffmpeg)" \
-    '[]' \
-    -1 \
-    "h264"
+    "individual / movie / flat / auto" \
+    '["1001"]' -1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "individual / movie / flat / passthrough" \
+    '["1001"]' 0 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "individual / movie / flat / ffmpeg" \
+    '["1001"]' 1 "flat" "h264"
+restart_egress
+
+# -- Composite: mixed content --
+run_recording_test \
+    "composite / movie+sintel / flat / auto" \
+    '["1001","1002"]' -1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / movie+sintel / flat / ffmpeg" \
+    '["1001","1002"]' 1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / movie+sintel / grid / auto" \
+    '["1001","1002"]' -1 "grid" "h264"
+restart_egress
+
+# -- Composite all with mixed content --
+run_recording_test \
+    "composite-all / movie+sintel / flat / auto" \
+    '[]' -1 "flat" "h264"
+restart_egress
+
+# ==============================================================================
+# PART 5: SAME CONTENT BOTH USERS (Sintel + Sintel)
+# Tests that composite with identical content renders correctly.
+# ==============================================================================
+
+log ""
+log "==== PART 5: SAME CONTENT (Sintel + Sintel) ===="
+log ""
+
+restart_streams "$VIDEO_SINTEL" "$VIDEO_SINTEL"
+
+run_recording_test \
+    "individual / sintel / flat / passthrough" \
+    '["1001"]' 0 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "individual / sintel / flat / ffmpeg" \
+    '["1001"]' 1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / sintel+sintel / flat / ffmpeg" \
+    '["1001","1002"]' 1 "flat" "h264"
+restart_egress
+
+run_recording_test \
+    "composite / sintel+sintel / grid / auto" \
+    '["1001","1002"]' -1 "grid" "h264"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -581,7 +1038,7 @@ for r in "${RESULTS[@]}"; do
 done
 log ""
 log "Total: $PASS passed, $FAIL failed, $SKIP skipped"
-log "Logs: $LOG_DIR/"
+log "Outputs: $E2E_OUTPUT_DIR/"
 log "============================================"
 
 if [ "$FAIL" -gt 0 ]; then
