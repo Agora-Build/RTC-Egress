@@ -557,24 +557,25 @@ fi
 log "Using stream-to-agora: $STREAM_TOOL"
 
 # ── Download test videos ──────────────────────────────────────────────────────
-# All videos must have both video (h264) and audio (aac) tracks.
-#   - Sintel trailer (4MB)  — dark fantasy animation, h264+aac
-#   - BBB trailer (11MB)    — colorful animal animation, h264+aac
-#   - Movie 300 (2.7MB)     — live action test clip, h264+aac
+# All videos must have h264 video + stereo aac audio (stream-to-agora requirement).
+#   - BBB full (116MB)      — Big Buck Bunny 640x360, h264+aac stereo 44.1kHz
+#   - Sintel trailer (4MB)  — dark fantasy animation, h264+aac stereo 48kHz
+#   - Movie 300 (2.7MB)     — live action test clip, h264+aac mono 22kHz
+# Note: BBB is large but already cached after first download.
 
 mkdir -p "$FIXTURES_DIR"
 
+VIDEO_BBB="$FIXTURES_DIR/bigbuckbunny_360.m4v"
 VIDEO_SINTEL="$FIXTURES_DIR/sintel_trailer.mp4"
-VIDEO_BBB="$FIXTURES_DIR/bbb_trailer.mp4"
 VIDEO_MOVIE="$FIXTURES_DIR/movie_300.mp4"
 
 declare -A VIDEO_URLS=(
+    ["$VIDEO_BBB"]="https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_640x360.m4v"
     ["$VIDEO_SINTEL"]="https://media.w3.org/2010/05/sintel/trailer.mp4"
-    ["$VIDEO_BBB"]="https://media.w3.org/2010/05/bunny/trailer.mp4"
     ["$VIDEO_MOVIE"]="https://media.w3.org/2010/05/video/movie_300.mp4"
 )
 
-for vfile in "$VIDEO_SINTEL" "$VIDEO_BBB" "$VIDEO_MOVIE"; do
+for vfile in "$VIDEO_BBB" "$VIDEO_SINTEL" "$VIDEO_MOVIE"; do
     if [ ! -f "$vfile" ]; then
         log "Downloading $(basename "$vfile") ..."
         curl -sL "${VIDEO_URLS[$vfile]}" -o "$vfile" || {
