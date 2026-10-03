@@ -386,8 +386,8 @@ TEST_F(RealFileGenerationTest, RealTSStreamGeneration) {
     ASSERT_TRUE(recordingSink.initialize(config));
     ASSERT_TRUE(recordingSink.start());
 
-    // Generate 6 seconds of content to create multiple TS segments
-    const int totalFrames = 180;  // 6 seconds * 30fps
+    // Keyframe alignment can extend each segment by a GOP; feed enough for three segments.
+    const int totalFrames = 240;  // 8 seconds * 30fps
     const uint64_t frameInterval = 33;
 
     for (int i = 0; i < totalFrames; i++) {
@@ -440,7 +440,7 @@ TEST_F(RealFileGenerationTest, RealTSStreamGeneration) {
 
         recordingSink.onAudioFrame(audioBuffer.data(), 960, 48000, 2, timestamp, "ts_user");
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));  // Realistic timing
+        std::this_thread::sleep_for(std::chrono::milliseconds(frameInterval));
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // Allow final segment
@@ -480,7 +480,7 @@ TEST_F(RealFileGenerationTest, RealTSStreamGeneration) {
     }
 
     // Now TS files should be found every time
-    EXPECT_GT(tsSegmentCount, 2);   // Should have multiple segments for 6 seconds
+    EXPECT_GT(tsSegmentCount, 2);   // Should have at least three keyframe-aligned segments
     EXPECT_TRUE(foundPlaylist);     // Playlist should be generated
     EXPECT_GT(totalTSSize, 15000);  // Total size should be reasonable
 }

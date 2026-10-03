@@ -1,7 +1,10 @@
 #include "helper.h"
 
-#include <thread>
 #include <unistd.h>
+
+#include <cstdio>
+#include <stdexcept>
+#include <thread>
 
 void waitBeforeNextSend(PacerInfo& pacer) {
   auto sendFrameEndTime = std::chrono::steady_clock::now();
@@ -26,12 +29,14 @@ std::string getCurrentSystemTimeChrono() {
               .count() *
           1000;
   time_t tt = std::chrono::system_clock::to_time_t(now);
-  auto time_tm = localtime(&tt);
-  char strTime[25] = {0};
-  sprintf(strTime, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
-          time_tm->tm_year + 1900, time_tm->tm_mon + 1, time_tm->tm_mday,
-          time_tm->tm_hour, time_tm->tm_min, time_tm->tm_sec,
-          (int)dis_millseconds);
+  tm time_tm{};
+  if (!localtime_r(&tt, &time_tm)) {
+    throw std::runtime_error("Failed to convert the current local time");
+  }
+  char strTime[128] = {0};
+  std::snprintf(strTime, sizeof(strTime), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                time_tm.tm_year + 1900, time_tm.tm_mon + 1, time_tm.tm_mday, time_tm.tm_hour,
+                time_tm.tm_min, time_tm.tm_sec, (int)dis_millseconds);
   return std::string(strTime);
 }
 

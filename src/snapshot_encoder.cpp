@@ -65,6 +65,7 @@ bool SnapshotEncoder::encodeYUVToJPEG(const uint8_t* yBuffer, const uint8_t* uBu
 
         // Prepare input frame
         AVFrame* frame = context_->inputFrame;
+        av_frame_unref(frame);
 
         // Set frame properties
         frame->format = AV_PIX_FMT_YUV420P;
@@ -145,9 +146,12 @@ bool SnapshotEncoder::encodeYUVToJPEG(const uint8_t* yBuffer, const uint8_t* uBu
     auto end = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    stats_.totalEncodes++;
-    stats_.totalTimeMs += duration;
-    stats_.averageTimeMs = stats_.totalTimeMs / stats_.totalEncodes;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.totalEncodes++;
+        stats_.totalTimeMs += duration;
+        stats_.averageTimeMs = stats_.totalTimeMs / stats_.totalEncodes;
+    }
 
     return true;
 }
@@ -207,7 +211,10 @@ bool SnapshotEncoder::setupEncoder(int width, int height) {
     // Threading options
     if (config_.useThreads) {
         ctx->thread_count = 0;  // Auto-detect CPU count
-        ctx->thread_type = FF_THREAD_FRAME;
+        // Each call must return its own JPEG without waiting for another frame.
+        ctx->thread_type = FF_THREAD_SLICE;
+    } else {
+        ctx->thread_count = 1;
     }
 
     // Open codec

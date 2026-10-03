@@ -2,8 +2,13 @@
 
 #include "snapshot_sink.h"
 
+#include <sched.h>
+#include <sys/resource.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
@@ -29,6 +34,11 @@ bool SnapshotSink::initialize(const Config& config) {
 
     if (isCapturing_.load()) {
         AG_LOG_FAST(ERROR, "Cannot initialize while capturing");
+        return false;
+    }
+
+    if (config.snapshotPriority < 1 || config.snapshotPriority > 99) {
+        AG_LOG_FAST(ERROR, "Snapshot thread priority must be between 1 and 99");
         return false;
     }
 
@@ -230,6 +240,9 @@ void SnapshotSink::onVideoFrame(const uint8_t* yBuffer, const uint8_t* uBuffer,
 
 void SnapshotSink::captureThread() {
     AG_LOG_FAST(INFO, "Capture thread started, interval: %ldms", config_.intervalInMs);
+
+    // Set high priority for snapshot processing thread
+    setThreadPriority(config_.snapshotPriority, "snapshot");
     while (!stopRequested_.load()) {
         FrameData frameToSave;
         {
@@ -390,6 +403,46 @@ void SnapshotSink::onComposedFrame(const AVFrame* composedFrame) {
     } catch (const std::exception& e) {
         AG_LOG_FAST(ERROR, "Exception processing composed frame: %s", e.what());
         return;
+    }
+}
+
+void SnapshotSink::setThreadPriority(int priority, const std::string& threadName) {
+    // Always set priority for consistent snapshot performance
+    if (config_.useRealTimeScheduling) {
+        // Use SCHED_FIFO for real-time scheduling (better for snapshots)
+        struct sched_param param;
+        param.sched_priority = priority;
+
+        if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+            // Fall back to nice priority if real-time scheduling fails
+            AG_LOG_FAST(WARN, "Failed to set SCHED_FIFO priority %d for %s thread: %s", priority,
+                        threadName.c_str(), strerror(errno));
+            AG_LOG_FAST(INFO, "Falling back to nice priority for %s thread", threadName.c_str());
+
+            // Convert RT priority (1-99) to nice priority (-20 to 19)
+            int nice_priority = std::clamp(20 - (priority * 40 / 99), -20, 19);
+            if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+                AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                            threadName.c_str(), strerror(errno));
+            } else {
+                AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                            threadName.c_str());
+            }
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set SCHED_FIFO priority %d for %s thread", priority,
+                        threadName.c_str());
+        }
+    } else {
+        // Use traditional nice priority
+        // Convert RT priority (1-99) to nice priority (-20 to 19)
+        int nice_priority = std::clamp(20 - (priority * 40 / 99), -20, 19);
+        if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+            AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                        threadName.c_str(), strerror(errno));
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                        threadName.c_str());
+        }
     }
 }
 

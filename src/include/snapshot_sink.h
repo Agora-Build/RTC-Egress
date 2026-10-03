@@ -32,6 +32,10 @@ class SnapshotSink {
         // Metadata tracking
         std::string taskId = "";   // Task identifier for metadata
         std::string channel = "";  // Channel name for metadata
+
+        // Thread priority settings (always enabled for consistent performance)
+        bool useRealTimeScheduling = true;  // Use SCHED_FIFO for real-time scheduling
+        int snapshotPriority = 60;          // Snapshot thread priority (1-99, higher = more urgent)
     };
 
     SnapshotSink();
@@ -68,6 +72,9 @@ class SnapshotSink {
    private:
     // Worker thread function
     void captureThread();
+
+    // Priority utilities
+    void setThreadPriority(int priority, const std::string& threadName);
 
     // Save a single frame using new encoder
     bool saveFrame(const VideoFrame& frame, const std::string& filename);

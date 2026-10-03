@@ -16,6 +16,8 @@ find_package(PkgConfig REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../agora_sdk/include)
+
 # FFmpeg packages (needed by real components)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
@@ -220,3 +222,39 @@ target_link_libraries(snapshot_filter_tests
 )
 
 add_test(NAME SnapshotFilterTests COMMAND snapshot_filter_tests)
+
+add_executable(recording_thread_tests
+    recording_thread_tests.cpp
+    ../src/recording_sink.cpp
+    ../src/snapshot_sink.cpp
+    ../src/video_compositor.cpp
+    ../src/video_frame.cpp
+    ../src/layout_detector.cpp
+    ../src/snapshot_encoder.cpp
+    ../src/ts_segment_manager.cpp
+    ../src/metadata_manager.cpp
+    ../src/common/ffmpeg_utils.cpp
+    ../src/common/file_utils.cpp
+    ../src/common/helper.cpp
+)
+
+target_include_directories(recording_thread_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/common
+)
+
+target_link_libraries(recording_thread_tests
+    GTest::GTest
+    GTest::Main
+    PkgConfig::FFMPEG
+    yaml-cpp
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    pthread
+    dl
+    rt
+    m
+)
+
+add_test(NAME RecordingThreadTests COMMAND recording_thread_tests)
+set_tests_properties(RecordingThreadTests PROPERTIES TIMEOUT 30)

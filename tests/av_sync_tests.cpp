@@ -90,8 +90,8 @@ class AVSyncTestFramework {
             }
         }
 
-        frame.audioBuffer.resize(audioSamples * channels * sizeof(int16_t));
-        memcpy(frame.audioBuffer.data(), audioData.data(), frame.audioBuffer.size());
+        const auto* audioBytes = reinterpret_cast<const uint8_t*>(audioData.data());
+        frame.audioBuffer.assign(audioBytes, audioBytes + audioData.size() * sizeof(int16_t));
 
         return frame;
     }
@@ -170,7 +170,7 @@ TEST_F(AVSyncTest, PerfectAVSynchronization) {
 
     // Generate 60 frames (2 seconds) with perfect A/V sync
     for (int i = 0; i < 60; i++) {
-        uint64_t timestamp = i * 33;  // 30fps
+        uint64_t timestamp = 1000 + i * 33;  // Leave room for negative A/V offsets.
         auto frame =
             framework_->generatePreciseFrame("sync_perfect", timestamp, 0);  // 0ms A/V offset
 
@@ -218,7 +218,7 @@ TEST_F(AVSyncTest, AudioLeadingVideo) {
 
     // Generate frames with audio leading by 40ms
     for (int i = 0; i < 60; i++) {
-        uint64_t timestamp = i * 33;
+        uint64_t timestamp = 1000 + i * 33;
         auto frame = framework_->generatePreciseFrame("sync_audio_lead", timestamp,
                                                       -40);  // Audio 40ms ahead
 
@@ -262,7 +262,7 @@ TEST_F(AVSyncTest, VideoLeadingAudio) {
     std::vector<uint64_t> audioTimestamps;
 
     for (int i = 0; i < 60; i++) {
-        uint64_t timestamp = i * 33;
+        uint64_t timestamp = 1000 + i * 33;
         auto frame = framework_->generatePreciseFrame("sync_video_lead", timestamp,
                                                       60);  // Audio 60ms behind
 
@@ -307,7 +307,7 @@ TEST_F(AVSyncTest, VariableAVSync) {
 
     // Generate frames with variable A/V offsets (simulating jitter)
     for (int i = 0; i < 60; i++) {
-        uint64_t timestamp = i * 33;
+        uint64_t timestamp = 1000 + i * 33;
         int64_t jitter = (i % 10 - 5) * 10;  // -50ms to +40ms jitter
         auto frame = framework_->generatePreciseFrame("sync_jitter", timestamp, jitter);
 

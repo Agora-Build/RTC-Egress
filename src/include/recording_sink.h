@@ -72,6 +72,11 @@ class RecordingSink {
         int videoBufferSize = 30;   // frames
         int audioBufferSize = 100;  // frames
 
+        // Thread priority settings (always use separate threads)
+        bool useRealTimeScheduling = true;  // Use SCHED_FIFO for real-time scheduling
+        int audioPriority = 80;             // Audio thread priority (1-99, higher = more urgent)
+        int videoPriority = 70;             // Video thread priority (1-99, higher = more urgent)
+
         // User filtering
         std::vector<std::string> targetUsers;  // Empty means record all users
 
@@ -104,6 +109,7 @@ class RecordingSink {
 
     // Set callback for task completion notifications
     void setCompletionCallback(CompletionCallback callback) {
+        std::lock_guard<std::mutex> lock(mutex_);
         completionCallback_ = callback;
     }
 
@@ -191,6 +197,7 @@ class RecordingSink {
         bool audioStreamActive = false;  // Whether audio stream is active
         uint64_t lastVideoRtcTs = 0;     // Last received video RTC timestamp
         uint64_t lastAudioRtcTs = 0;     // Last received audio RTC timestamp
+        uint64_t lastSyncCheckTime = 0;
 
         // swsContext input resolution tracking
         int lastInputWidth = 0;   // Last input video width
@@ -208,8 +215,17 @@ class RecordingSink {
 
     // Thread functions
     void recordingThread();
+    void audioProcessingThreadLoop();  // Dedicated audio processing loop
+    void videoProcessingThreadLoop();  // Dedicated video processing loop
+    void wakeProcessingThreads();
     void processVideoFrames();
     void processAudioFrames();
+
+    // Priority utilities
+    void setThreadPriority(int priority, const std::string& threadName);
+
+    // A/V sync utilities
+    void validateAVSync(UserContext* context, const std::string& userId);
 
     // FFmpeg setup and cleanup
     bool initializeEncoder(const std::string& userId = "");
@@ -265,8 +281,12 @@ class RecordingSink {
 
     // Threading
     std::unique_ptr<std::thread> recordingThread_;
+    std::unique_ptr<std::thread> audioProcessingThread_;  // Dedicated audio processing thread
+    std::unique_ptr<std::thread> videoProcessingThread_;  // Dedicated video processing thread
     std::mutex mutex_;
     std::condition_variable cv_;
+    bool stopInProgress_ = false;  // Protected by mutex_
+    std::thread::id recordingThreadId_;
 
     // Frame buffers
     std::queue<VideoFrame> videoFrameQueue_;
@@ -278,6 +298,7 @@ class RecordingSink {
 
     std::map<std::string, std::unique_ptr<UserContext>> userContexts_;
     std::map<std::string, std::unique_ptr<PassthroughContext>> passthroughContexts_;
+    // Both workers hold this lock while accessing shared timing, encoders, and muxers.
     std::mutex userContextsMutex_;
 
     // For composite mode
@@ -334,6 +355,7 @@ class RecordingSink {
 
     // Task completion callback
     CompletionCallback completionCallback_;
+    const int64_t SYNC_DRIFT_THRESHOLD = 9000;  // 100ms in 90kHz timebase
 };
 
 }  // namespace rtc

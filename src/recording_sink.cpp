@@ -4,9 +4,12 @@
 
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -43,8 +46,14 @@ RecordingSink::~RecordingSink() {
 bool RecordingSink::initialize(const Config& config) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (isRecording_.load()) {
+    if (isRecording_.load() || stopInProgress_) {
         AG_LOG_FAST(ERROR, "Cannot initialize while recording");
+        return false;
+    }
+
+    if (config.audioPriority < 1 || config.audioPriority > 99 || config.videoPriority < 1 ||
+        config.videoPriority > 99) {
+        AG_LOG_FAST(ERROR, "Audio and video thread priorities must be between 1 and 99");
         return false;
     }
 
@@ -112,14 +121,24 @@ bool RecordingSink::initialize(const Config& config) {
 }
 
 bool RecordingSink::start() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
 
-    if (isRecording_.load()) {
+    if (isRecording_.load() || stopInProgress_) {
         AG_LOG_FAST(WARN, "Already recording");
         return false;
     }
 
+    if (recordingThread_) {
+        if (recordingThreadId_ == std::this_thread::get_id()) return false;
+        // Reap the coordinator retained by a duration-completion callback.
+        lock.unlock();
+        stop();
+        lock.lock();
+        if (isRecording_.load() || stopInProgress_ || recordingThread_) return false;
+    }
+
     stopRequested_ = false;
+    tsPendingSegmentRotation_ = false;
     isRecording_ = true;
     startTime_ = std::chrono::steady_clock::now();
 
@@ -168,8 +187,19 @@ bool RecordingSink::start() {
         }
     }
 
-    // Create recording thread
+    // Create recording thread for main coordination
     recordingThread_ = std::make_unique<std::thread>(&RecordingSink::recordingThread, this);
+    recordingThreadId_ = recordingThread_->get_id();
+
+    // Always create separate audio and video processing threads
+    if (config_.recordAudio) {
+        audioProcessingThread_ =
+            std::make_unique<std::thread>(&RecordingSink::audioProcessingThreadLoop, this);
+    }
+    if (config_.recordVideo) {
+        videoProcessingThread_ =
+            std::make_unique<std::thread>(&RecordingSink::videoProcessingThreadLoop, this);
+    }
 
     AG_LOG_FAST(INFO, "Started recording in %s mode",
                 (config_.mode == VideoCompositor::Mode::Composite ? "composite" : "individual"));
@@ -180,28 +210,70 @@ bool RecordingSink::start() {
 void RecordingSink::stop() {
     AG_LOG_TS(INFO, "RecordingSink::stop() called - requesting thread shutdown");
 
+    bool wasRecording;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
 
-        if (!isRecording_.load()) {
+        if (stopInProgress_) {
+            // A completion callback must let an external stop finish joining this thread.
+            if (std::this_thread::get_id() == recordingThreadId_) return;
+            cv_.wait(lock, [this] { return !stopInProgress_; });
+        }
+
+        wasRecording = isRecording_.load();
+        if (!wasRecording && !recordingThread_) {
             AG_LOG_TS(INFO, "Already stopped, returning early");
             return;
         }
 
+        stopInProgress_ = true;
         stopRequested_ = true;
 
         cv_.notify_all();
-        videoQueueCv_.notify_all();
-        audioQueueCv_.notify_all();
+    }
+    wakeProcessingThreads();
+
+    if (audioProcessingThread_ && audioProcessingThread_->joinable()) {
+        audioProcessingThread_->join();
+        audioProcessingThread_.reset();
+    }
+    if (videoProcessingThread_ && videoProcessingThread_->joinable()) {
+        videoProcessingThread_->join();
+        videoProcessingThread_.reset();
+    }
+    // A duration-completion callback can call stop from the coordinator itself.
+    // Keep that thread joinable for the next external stop or the destructor.
+    if (recordingThread_ && recordingThread_->get_id() != std::this_thread::get_id()) {
+        recordingThread_->join();
+        recordingThread_.reset();
     }
 
-    // Give the recording thread a moment to see the stop flag
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    flushAllEncoders();
+    if (!wasRecording) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopInProgress_ = false;
+        cv_.notify_all();
+        return;
+    }
 
     if (videoCompositor_) {
         videoCompositor_->cleanup();
+    }
+
+    // Finalize encoders before the segment manager renames the last segment.
+    {
+        std::lock_guard<std::mutex> lock(userContextsMutex_);
+        if (compositeContext_) {
+            cleanupEncoder("");
+            compositeContext_.reset();
+        }
+        for (auto& pair : userContexts_) {
+            cleanupEncoder(pair.first);
+        }
+        userContexts_.clear();
+        for (auto& pair : passthroughContexts_) {
+            cleanupPassthroughContext(pair.first);
+        }
+        passthroughContexts_.clear();
     }
 
     // End TS session if using TS format
@@ -256,56 +328,19 @@ void RecordingSink::stop() {
         metadataManager_->endSession(config_.taskId, "normal", config_.outputDir);
     }
 
-    if (recordingThread_ && recordingThread_->joinable()) {
-        AG_LOG_TS(INFO, "About to join recording thread...");
-
-        recordingThread_->join();
-
-        AG_LOG_TS(INFO, "Recording thread joined successfully");
-
-        recordingThread_.reset();
-    }
-
-    // Ensure all frames are processed before cleanup
-    AG_LOG_TS(INFO, "Processing remaining frames before cleanup...");
-
-    processVideoFrames();
-    AG_LOG_TS(INFO, "Final video frames processed");
-
-    processAudioFrames();
-    AG_LOG_TS(INFO, "Final audio frames processed");
-
-    // Cleanup all user contexts
-    AG_LOG_TS(INFO, "Starting cleanup of user contexts...");
-
     {
-        std::lock_guard<std::mutex> lock(userContextsMutex_);
-
-        // Process composite context first
-        if (compositeContext_) {
-            AG_LOG_TS(INFO, "Cleaning up composite context...");
-            cleanupEncoder("");
-            compositeContext_.reset();
-            AG_LOG_TS(INFO, "Composite context cleaned up");
-        }
-
-        // Process individual user contexts
-        AG_LOG_FAST(INFO, "Cleaning up %zu user contexts...", userContexts_.size());
-
-        for (auto& pair : userContexts_) {
-            AG_LOG_FAST(INFO, "Cleaning up encoder for user: %s", pair.first.c_str());
-            cleanupEncoder(pair.first);
-            AG_LOG_TS(INFO, "Encoder cleaned up for user: %s", pair.first.c_str());
-        }
-        userContexts_.clear();
-
-        // Cleanup passthrough contexts
-        for (auto& pair : passthroughContexts_) {
-            cleanupPassthroughContext(pair.first);
-        }
-        passthroughContexts_.clear();
-
-        AG_LOG_TS(INFO, "All user contexts cleared");
+        std::lock_guard<std::mutex> lock(videoQueueMutex_);
+        videoFrameQueue_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        audioFrameQueue_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(audioMixingMutex_);
+        audioMixingBuffer_.clear();
+        lastAudioMixTime_ = 0;
+        maxAudioLevel_ = 0.0f;
     }
 
     // Cleanup performance caches
@@ -315,7 +350,12 @@ void RecordingSink::stop() {
 
     AG_LOG_TS(INFO, "Composite resources cleaned up");
 
-    isRecording_ = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        isRecording_ = false;
+        stopInProgress_ = false;
+        cv_.notify_all();
+    }
     AG_LOG_TS(INFO, "Stopped recording and saved files");
 }
 
@@ -349,6 +389,7 @@ void RecordingSink::onVideoFrame(const uint8_t* yBuffer, const uint8_t* uBuffer,
     try {
         {
             std::unique_lock<std::mutex> lock(videoQueueMutex_);
+            if (!isRecording() || !config_.recordVideo) return;
             // Drop oldest frames if buffer is full to prevent unbounded memory growth
             while (videoFrameQueue_.size() >= config_.videoBufferSize) {
                 videoFrameQueue_.pop();
@@ -422,6 +463,7 @@ void RecordingSink::onAudioFrame(const uint8_t* audioBuffer, int samples, int sa
 
         {
             std::unique_lock<std::mutex> lock(audioQueueMutex_);
+            if (!isRecording() || !config_.recordAudio) return;
             // Drop oldest frames if buffer is full to prevent unbounded memory growth
             while (audioFrameQueue_.size() >= config_.audioBufferSize) {
                 audioFrameQueue_.pop();
@@ -444,33 +486,30 @@ void RecordingSink::recordingThread() {
     AG_LOG_FAST(INFO, "Recording thread started");
 
     while (!stopRequested_.load()) {
-        // Process video frames
-        if (config_.recordVideo) {
-            processVideoFrames();
-        }
-
-        // Process audio frames
-        if (config_.recordAudio) {
-            processAudioFrames();
-        }
-
         // Check for TS segment rotation
         if (config_.format == OutputFormat::TS && tsSegmentManager_) {
             checkAndRotateSegmentIfNeeded();
         }
 
         // Check for timeout
+        std::unique_lock<std::mutex> lock(mutex_);
         auto elapsed = std::chrono::steady_clock::now() - startTime_;
         if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >=
             config_.maxDurationSeconds) {
             AG_LOG_FAST(INFO, "Max duration reached, breaking from recording loop");
+            if (stopRequested_.load()) break;
+            stopRequested_ = true;
+            cv_.notify_all();
+            auto callback = completionCallback_;
+            auto taskId = config_.taskId;
+            lock.unlock();
+            wakeProcessingThreads();
 
             // Notify task completion when max duration is reached
-            if (completionCallback_ && !config_.taskId.empty()) {
+            if (callback && !taskId.empty()) {
                 AG_LOG_FAST(INFO, "Notifying task completion for max duration reached: %s",
-                            config_.taskId.c_str());
-                completionCallback_(config_.taskId, "success",
-                                    "Recording completed - max duration reached");
+                            taskId.c_str());
+                callback(taskId, "success", "Recording completed - max duration reached");
             }
 
             break;
@@ -484,7 +523,6 @@ void RecordingSink::recordingThread() {
 
         // Use condition variable with timeout instead of sleep_for
         // This allows the thread to be woken up immediately when stop is requested
-        std::unique_lock<std::mutex> lock(mutex_);
         bool shouldStop = cv_.wait_for(lock, std::chrono::milliseconds(10),
                                        [this] { return stopRequested_.load(); });
 
@@ -692,10 +730,12 @@ bool RecordingSink::initializeEncoder(const std::string& userId) {
     }
 
     // Log the actual time bases after header is written
-    AG_LOG_FAST(INFO, "Stream time base: %d/%d, Codec time base: %d/%d",
-                context->videoStream->time_base.num, context->videoStream->time_base.den,
-                context->videoCodecContext->time_base.num,
-                context->videoCodecContext->time_base.den);
+    if (context->videoStream && context->videoCodecContext) {
+        AG_LOG_FAST(INFO, "Stream time base: %d/%d, Codec time base: %d/%d",
+                    context->videoStream->time_base.num, context->videoStream->time_base.den,
+                    context->videoCodecContext->time_base.num,
+                    context->videoCodecContext->time_base.den);
+    }
 
     // Save filename before moving context
     std::string filename = context->filename;
@@ -745,17 +785,16 @@ bool RecordingSink::setupVideoEncoder(AVCodecContext** videoCodecContext,
     };
 
     std::vector<EncoderCandidate> candidates;
+    candidates.reserve(4);
 
     if (config_.videoCodec == "libx264" || config_.videoCodec == "h264") {
-        candidates = {
-            {"h264_nvenc", AV_PIX_FMT_YUV420P, true},  // NVIDIA GPU
-            {"h264_vaapi", AV_PIX_FMT_VAAPI, true},    // Intel/AMD VA-API
-            {"h264_qsv", AV_PIX_FMT_NV12, true},       // Intel Quick Sync
-            {"libx264", AV_PIX_FMT_YUV420P, false},    // Software fallback
-        };
+        candidates.push_back({"h264_nvenc", AV_PIX_FMT_YUV420P, true});
+        candidates.push_back({"h264_vaapi", AV_PIX_FMT_VAAPI, true});
+        candidates.push_back({"h264_qsv", AV_PIX_FMT_NV12, true});
+        candidates.push_back({"libx264", AV_PIX_FMT_YUV420P, false});
     } else {
         // Non-H264 codec: use as-is without hwaccel probing
-        candidates = {{config_.videoCodec.c_str(), AV_PIX_FMT_YUV420P, false}};
+        candidates.push_back({config_.videoCodec.c_str(), AV_PIX_FMT_YUV420P, false});
     }
 
     const AVCodec* codec = nullptr;
@@ -895,11 +934,17 @@ bool RecordingSink::encodeVideoFrame(const VideoFrame& frame, const std::string&
             it = userContexts_.find(userId);
         }
 
-        return encodeIndividualFrame(frame, it->second.get());
+        bool result = encodeIndividualFrame(frame, it->second.get());
+
+        // Validate A/V sync after successful video encoding (individual mode)
+        if (result) {
+            validateAVSync(it->second.get(), userId);
+        }
+
+        return result;
     } else {
         // Composite mode - update composite buffer and potentially create composite frame
-        bool result = updateCompositeFrame(frame, userId);
-        return result;
+        return updateCompositeFrame(frame, userId);
     }
 }
 
@@ -1439,6 +1484,10 @@ bool RecordingSink::encodeIndividualAudioFrame(const AudioFrame& frame, UserCont
     }
 
     av_packet_free(&packet);
+
+    // Validate A/V sync after successful audio encoding
+    validateAVSync(context, userId);
+
     return true;
 }
 
@@ -1758,27 +1807,24 @@ void RecordingSink::cleanupEncoder(const std::string& userId) {
         context->audioSampleBuffer.clear();
     }
 
-    // Write any buffered frames
-    if (context->videoCodecContext) {
+    auto flushEncoder = [this, context](AVCodecContext* codec, AVStream* stream) {
+        if (!codec || !stream) return;
         AVPacket* pkt = av_packet_alloc();
         if (pkt) {
-            // Flush the encoder
-            avcodec_send_frame(context->videoCodecContext, nullptr);
-            while (avcodec_receive_packet(context->videoCodecContext, pkt) == 0) {
-                // Set stream index and proper timestamps
-                pkt->stream_index = context->videoStream->index;
-                int64_t ticks_per_frame = context->videoStream->time_base.den / config_.videoFps;
-                pkt->pts = context->videoFrameCount * ticks_per_frame;
-                pkt->dts = pkt->pts;
-                pkt->duration = ticks_per_frame;
-                context->videoFrameCount++;
-
-                av_interleaved_write_frame(context->formatContext, pkt);
+            avcodec_send_frame(codec, nullptr);
+            while (avcodec_receive_packet(codec, pkt) == 0) {
+                pkt->stream_index = stream->index;
+                av_packet_rescale_ts(pkt, codec->time_base, stream->time_base);
+                writePacket(pkt, context->formatContext, stream);
                 av_packet_unref(pkt);
             }
             av_packet_free(&pkt);
+        } else {
+            AG_LOG_FAST(ERROR, "Could not allocate a packet to flush encoder");
         }
-    }
+    };
+    flushEncoder(context->videoCodecContext, context->videoStream);
+    flushEncoder(context->audioCodecContext, context->audioStream);
 
     // Write trailer
     if (context->formatContext) {
@@ -2006,6 +2052,7 @@ void RecordingSink::onComposedFrame(const AVFrame* composedFrame) {
     }
 
     std::lock_guard<std::mutex> contextLock(userContextsMutex_);
+    if (!isRecording()) return;
 
     // Initialize composite context if needed
     if (!compositeContext_) {
@@ -2157,6 +2204,7 @@ void RecordingSink::onComposedFrame(const AVFrame* composedFrame) {
     }
 
     av_packet_free(&packet);
+    validateAVSync(context, "composite");
 }
 
 void RecordingSink::cleanupCompositeResources() {
@@ -2295,6 +2343,7 @@ bool RecordingSink::detectStreamRestart(UserContext* context, bool isVideo, uint
 }
 
 void RecordingSink::checkAndRotateSegmentIfNeeded() {
+    std::lock_guard<std::mutex> lock(userContextsMutex_);
     if (!tsSegmentManager_) {
         static int null_mgr_log_count = 0;
         if (null_mgr_log_count++ == 0) {
@@ -2502,6 +2551,8 @@ void RecordingSink::onEncodedVideoFrame(uint32_t uid, const uint8_t* data, size_
     }
 
     std::lock_guard<std::mutex> lock(userContextsMutex_);
+
+    if (!isRecording()) return;
 
     auto it = passthroughContexts_.find(userId);
     if (it == passthroughContexts_.end()) {
@@ -3109,6 +3160,132 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
 
     av_packet_free(&packet);
     return true;
+}
+
+void RecordingSink::validateAVSync(UserContext* context, const std::string& userId) {
+    // The caller holds userContextsMutex_ for both streams' timing and muxer state.
+    // Validate A/V sync every 5 seconds to avoid excessive logging
+    uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+
+    if (currentTime - context->lastSyncCheckTime < 5000) {
+        return;  // Skip validation if called too recently
+    }
+
+    context->lastSyncCheckTime = currentTime;
+
+    // Check if both audio and video streams are active
+    if (!context->audioStreamActive || !context->videoStreamActive) {
+        return;  // Skip validation if either stream is inactive
+    }
+
+    // Calculate A/V sync drift
+    int64_t syncDrift = std::abs(context->lastAudioPts - context->lastVideoPts);
+
+    if (syncDrift > SYNC_DRIFT_THRESHOLD) {
+        AG_LOG_FAST(WARN,
+                    "A/V sync drift detected for user %s: %ld ticks (%.2fms) - Audio PTS: %ld, "
+                    "Video PTS: %ld",
+                    userId.c_str(), syncDrift, syncDrift / 90.0, context->lastAudioPts,
+                    context->lastVideoPts);
+
+        // Log timing information for debugging
+        AG_LOG_FAST(INFO, "Sync debug - Audio RTC: %lu, Video RTC: %lu, Time origin: %lu",
+                    context->lastAudioRtcTs, context->lastVideoRtcTs, context->rtcTimeOrigin);
+    } else {
+        AG_LOG_FAST(INFO, "A/V sync good for user %s: drift %ld ticks (%.2fms)", userId.c_str(),
+                    syncDrift, syncDrift / 90.0);
+    }
+}
+
+void RecordingSink::setThreadPriority(int priority, const std::string& threadName) {
+    // Always set priority for separate threads mode
+
+    if (config_.useRealTimeScheduling) {
+        // Use SCHED_FIFO for real-time scheduling (better for audio/video)
+        struct sched_param param;
+        param.sched_priority = priority;
+
+        if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+            // Fall back to nice priority if real-time scheduling fails
+            AG_LOG_FAST(WARN, "Failed to set SCHED_FIFO priority %d for %s thread: %s", priority,
+                        threadName.c_str(), strerror(errno));
+            AG_LOG_FAST(INFO, "Falling back to nice priority for %s thread", threadName.c_str());
+
+            // Convert RT priority (1-99) to nice priority (-20 to 19)
+            int nice_priority = std::clamp(20 - (priority * 40 / 99), -20, 19);
+            if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+                AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                            threadName.c_str(), strerror(errno));
+            } else {
+                AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                            threadName.c_str());
+            }
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set SCHED_FIFO priority %d for %s thread", priority,
+                        threadName.c_str());
+        }
+    } else {
+        // Use traditional nice priority
+        // Convert RT priority (1-99) to nice priority (-20 to 19)
+        int nice_priority = std::clamp(20 - (priority * 40 / 99), -20, 19);
+        if (setpriority(PRIO_PROCESS, 0, nice_priority) != 0) {
+            AG_LOG_FAST(WARN, "Failed to set nice priority %d for %s thread: %s", nice_priority,
+                        threadName.c_str(), strerror(errno));
+        } else {
+            AG_LOG_FAST(INFO, "Successfully set nice priority %d for %s thread", nice_priority,
+                        threadName.c_str());
+        }
+    }
+}
+
+void RecordingSink::audioProcessingThreadLoop() {
+    AG_LOG_FAST(INFO, "Audio processing thread started with high priority");
+
+    // Set urgent priority for audio processing thread
+    setThreadPriority(config_.audioPriority, "audio");
+
+    while (!stopRequested_.load()) {
+        std::unique_lock<std::mutex> lock(audioQueueMutex_);
+        audioQueueCv_.wait(lock,
+                           [this] { return stopRequested_.load() || !audioFrameQueue_.empty(); });
+        lock.unlock();
+
+        processAudioFrames();
+    }
+
+    AG_LOG_FAST(INFO, "Audio processing thread exiting");
+}
+
+void RecordingSink::videoProcessingThreadLoop() {
+    AG_LOG_FAST(INFO, "Video processing thread started with high priority");
+
+    // Set high priority for video processing thread
+    setThreadPriority(config_.videoPriority, "video");
+
+    while (!stopRequested_.load()) {
+        std::unique_lock<std::mutex> lock(videoQueueMutex_);
+        videoQueueCv_.wait(lock,
+                           [this] { return stopRequested_.load() || !videoFrameQueue_.empty(); });
+        lock.unlock();
+
+        processVideoFrames();
+    }
+
+    AG_LOG_FAST(INFO, "Video processing thread exiting");
+}
+
+void RecordingSink::wakeProcessingThreads() {
+    // Synchronize notifications with queue waits to avoid a lost shutdown wakeup.
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        audioQueueCv_.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lock(videoQueueMutex_);
+        videoQueueCv_.notify_all();
+    }
 }
 
 }  // namespace rtc
