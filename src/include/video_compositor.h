@@ -29,7 +29,7 @@ class VideoCompositor {
         uint32_t outputWidth = 1280;
         uint32_t outputHeight = 720;
         uint32_t maxUsers = 25;
-        uint64_t frameTimeoutMs = 1000;  // Keep frames for 1 second
+        uint64_t frameTimeoutMs = 2000;  // Match the default layout activity grace period.
         bool preserveAspectRatio = true;
         uint64_t minCompositeIntervalMs = 16;  // 60fps max
 

@@ -149,6 +149,11 @@ std::vector<std::string> LayoutDetector::onUserFrame(const std::string& userId,
         it->second.lastFrameMs = timestamp;
         it->second.frameCount++;
         it->second.hasRecentFrames = true;
+        if (it->second.state == UserState::LEAVING) {
+            it->second.state = UserState::ACTIVE;
+        } else if (it->second.state == UserState::LEFT) {
+            it->second = UserInfo(userId, timestamp);
+        }
     }
 
     // std::cout << "[LayoutDetector] onUserFrame() EXIT, userId=" << userId << std::endl;

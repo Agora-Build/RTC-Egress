@@ -339,8 +339,7 @@ void RecordingSink::stop() {
     {
         std::lock_guard<std::mutex> lock(audioMixingMutex_);
         audioMixingBuffer_.clear();
-        lastAudioMixTime_ = 0;
-        maxAudioLevel_ = 0.0f;
+        nextAudioMixSample_ = -1;
     }
 
     // Cleanup performance caches
@@ -576,57 +575,16 @@ void RecordingSink::processVideoFrames() {
 }
 
 void RecordingSink::processAudioFrames() {
-    // Early exit if stop is requested - don't even try to process frames
-    if (stopRequested_.load()) {
-        // std::cout << "[RecordingSink] processAudioFrames() - stopRequested detected at entry, "
-        //              "exiting immediately"
-        //           << std::endl;
-        // std::flush(std::cout);
-        return;
-    }
-
     std::unique_lock<std::mutex> lock(audioQueueMutex_);
-
-    // std::cout << "[RecordingSink] processAudioFrames() - queue size: " << audioFrameQueue_.size()
-    //           << std::endl;
-    // std::flush(std::cout);
-
     while (!audioFrameQueue_.empty()) {
-        // Check stop condition at the beginning of each iteration
-        if (stopRequested_.load()) {
-            // std::cout << "[RecordingSink] processAudioFrames() - stopRequested detected,
-            // breaking"
-            // << std::endl;
-            // std::flush(std::cout);
-            break;
-        }
-
-        AudioFrame frame = audioFrameQueue_.front();
+        AudioFrame frame = std::move(audioFrameQueue_.front());
         audioFrameQueue_.pop();
         lock.unlock();
-
-        // std::cout << "[RecordingSink] processAudioFrames() - about to encode frame" << std::endl;
-        // std::flush(std::cout);
-
-        if (frame.valid && !stopRequested_.load()) {
-            encodeAudioFrame(frame, frame.userId);
+        if (frame.valid && !encodeAudioFrame(frame, frame.userId)) {
+            AG_LOG_FAST(WARN, "Failed to encode audio from user %s", frame.userId.c_str());
         }
-
-        // std::cout << "[RecordingSink] processAudioFrames() - frame encoded, checking stop"
-        //           << std::endl;
-        // std::flush(std::cout);
-
         lock.lock();
-
-        // Check stop again after potentially blocking encode operation
-        if (stopRequested_.load()) {
-            AG_LOG_FAST(INFO, "processAudioFrames() - stopRequested after encode, breaking");
-            break;
-        }
     }
-
-    // std::cout << "[RecordingSink] processAudioFrames() - exiting" << std::endl;
-    // std::flush(std::cout);
 }
 
 bool RecordingSink::initializeEncoder(const std::string& userId) {
@@ -1492,143 +1450,146 @@ bool RecordingSink::encodeIndividualAudioFrame(const AudioFrame& frame, UserCont
 }
 
 bool RecordingSink::mixAudioFromMultipleUsers(const AudioFrame& frame, const std::string& userId) {
-    // std::cout << "[RecordingSink] mixAudioFromMultipleUsers called for user " << userId << " with
-    // "
-    //           << frame.data.size() << " bytes" << std::endl;
+    std::lock_guard<std::mutex> lock(audioMixingMutex_);
+    auto& input = audioMixingBuffer_[userId];
+    const auto now = std::chrono::steady_clock::now();
+    const int channels = config_.audioChannels;
+    const int rate = config_.audioSampleRate;
+    const int count = frame.data.size() / sizeof(int16_t) / frame.channels;
+    const auto* data = reinterpret_cast<const int16_t*>(frame.data.data());
+    std::vector<int16_t> converted;
 
-    // Convert audio frame to float format for mixing
-    std::vector<float> audioSamples;
-    int input_samples = frame.data.size() / sizeof(int16_t) / frame.channels;
-    const int16_t* input_data = reinterpret_cast<const int16_t*>(frame.data.data());
-
-    // Convert to float and normalize
-    audioSamples.resize(input_samples * frame.channels);
-    for (int i = 0; i < input_samples * frame.channels; i++) {
-        audioSamples[i] = static_cast<float>(input_data[i]) / 32768.0f;
+    if (frame.sampleRate != rate || frame.channels != channels) {
+        if (!input.resampler || input.sampleRate != frame.sampleRate ||
+            input.channels != frame.channels) {
+            input.resampler.reset();
+            SwrContext* resampler = nullptr;
+            AVChannelLayout source, destination;
+            av_channel_layout_default(&source, frame.channels);
+            av_channel_layout_default(&destination, channels);
+            int ret = swr_alloc_set_opts2(&resampler, &destination, AV_SAMPLE_FMT_S16, rate,
+                                          &source, AV_SAMPLE_FMT_S16, frame.sampleRate, 0, nullptr);
+            av_channel_layout_uninit(&source);
+            av_channel_layout_uninit(&destination);
+            input.resampler.reset(resampler);
+            if (ret < 0 || !resampler || swr_init(resampler) < 0) return false;
+            input.sampleRate = frame.sampleRate;
+            input.channels = frame.channels;
+        }
+        int capacity = swr_get_out_samples(input.resampler.get(), count);
+        if (capacity < 0) return false;
+        converted.resize(static_cast<size_t>(capacity) * channels);
+        const uint8_t* source[] = {frame.data.data()};
+        uint8_t* destination[] = {reinterpret_cast<uint8_t*>(converted.data())};
+        int produced = swr_convert(input.resampler.get(), destination, capacity, source, count);
+        if (produced < 0) return false;
+        converted.resize(static_cast<size_t>(produced) * channels);
+    } else {
+        input.resampler.reset();
+        converted.assign(data, data + count * channels);
     }
 
-    // Store user's audio in mixing buffer AND preserve the original RTC timestamp
-    {
-        std::lock_guard<std::mutex> lock(audioMixingMutex_);
-        audioMixingBuffer_[userId] = audioSamples;
-
-        // Store the most recent RTC timestamp for mixed audio frame generation
-        // This preserves the original RTC client timing like lastBufferedTimestamp does
-        lastAudioMixTime_ = frame.timestamp;
-
-        // std::cout << "[RecordingSink] Audio mixing buffer now has " << audioMixingBuffer_.size()
-        //           << " users, using RTC timestamp: " << frame.timestamp << std::endl;
+    int64_t timestampSample = av_rescale_q(frame.timestamp, {1, 1000}, {1, rate});
+    if (nextAudioMixSample_ < 0) {
+        nextAudioMixSample_ = timestampSample;
+        audioMixStart_ = now;
     }
+    int64_t end = input.firstSample + input.samples.size() / channels;
+    // Preserve PCM continuity across callback jitter; re-anchor a publisher after a real gap.
+    if (input.firstSample < 0 || timestampSample > end + rate / 10) {
+        input.samples.clear();
+        input.firstSample = timestampSample;
+    }
+    input.lastArrival = now;
+    input.samples.insert(input.samples.end(), converted.begin(), converted.end());
 
-    // Trigger mixing immediately when new audio data is available
-    return createMixedAudioFrame();
+    // Bound per-user storage to half a second, even if a producer outruns the encoder.
+    size_t limit = static_cast<size_t>(rate / 2) * channels;
+    while (input.samples.size() > limit) {
+        for (int ch = 0; ch < channels; ++ch) input.samples.pop_front();
+        ++input.firstSample;
+    }
+    return true;
 }
 
-bool RecordingSink::createMixedAudioFrame() {
+bool RecordingSink::createMixedAudioFrame(bool flush) {
     std::lock_guard<std::mutex> mixLock(audioMixingMutex_);
     std::lock_guard<std::mutex> contextLock(userContextsMutex_);
+    if (nextAudioMixSample_ < 0 || audioMixingBuffer_.empty()) return true;
+    const auto now = std::chrono::steady_clock::now();
+    const auto wait = std::chrono::milliseconds(AUDIO_MIX_WAIT_MS);
+    if (!flush && now - audioMixStart_ < wait) return true;
+    if (!compositeContext_ && !initializeEncoder("")) return false;
+    const int channels = config_.audioChannels;
+    const int rate = config_.audioSampleRate;
+    const int count = compositeContext_->audioCodecContext->frame_size;
+    if (count <= 0) return false;
 
-    // std::cout << "[RecordingSink] createMixedAudioFrame called with " <<
-    // audioMixingBuffer_.size()
-    //           << " users in buffer" << std::endl;
-
-    if (audioMixingBuffer_.empty()) {
-        return true;  // No audio to mix
-    }
-
-    // Initialize composite context if needed
-    if (!compositeContext_) {
-        if (!initializeEncoder("")) {
-            return false;
+    while (true) {
+        int64_t latest = nextAudioMixSample_;
+        int64_t earliest = INT64_MAX;
+        for (auto& pair : audioMixingBuffer_) {
+            auto& input = pair.second;
+            while (!input.samples.empty() && input.firstSample < nextAudioMixSample_) {
+                for (int ch = 0; ch < channels; ++ch) input.samples.pop_front();
+                ++input.firstSample;
+            }
+            if (!input.samples.empty()) {
+                earliest = std::min(earliest, input.firstSample);
+                latest = std::max(latest, input.firstSample + static_cast<int64_t>(
+                                                                  input.samples.size() / channels));
+            }
         }
-    }
-
-    // Find the maximum number of samples across all users
-    size_t maxSamples = 0;
-    for (const auto& pair : audioMixingBuffer_) {
-        maxSamples = std::max(maxSamples, pair.second.size());
-    }
-
-    if (maxSamples == 0) {
-        return true;  // No samples to mix
-    }
-
-    // Create mixed audio buffer
-    std::vector<float> mixedAudio(maxSamples, 0.0f);
-
-    // Mix all users' audio
-    for (const auto& pair : audioMixingBuffer_) {
-        const std::vector<float>& userAudio = pair.second;
-        for (size_t i = 0; i < userAudio.size() && i < maxSamples; i++) {
-            mixedAudio[i] += userAudio[i];
+        if (latest <= nextAudioMixSample_) break;
+        // Leave a timestamp gap when every publisher has been silent for a long time.
+        if (earliest > nextAudioMixSample_ + rate) nextAudioMixSample_ = earliest;
+        int64_t end = nextAudioMixSample_ + count;
+        if (!flush && latest < end) break;
+        if (!flush) {
+            for (const auto& pair : audioMixingBuffer_) {
+                const auto& input = pair.second;
+                int64_t inputEnd = input.firstSample + input.samples.size() / channels;
+                if (input.firstSample < end && inputEnd < end && now - input.lastArrival < wait)
+                    return true;
+            }
         }
-    }
 
-    // Normalize mixed audio to prevent clipping using a running average
-    float current_max = 0.0f;
-    for (float sample : mixedAudio) {
-        current_max = std::max(current_max, std::abs(sample));
-    }
-
-    // Update running average of max audio level
-    maxAudioLevel_ = (maxAudioLevel_ * 0.95f) + (current_max * 0.05f);
-
-    if (maxAudioLevel_ > 1.0f) {
-        float scale = 1.0f / maxAudioLevel_;
-        for (float& sample : mixedAudio) {
-            sample *= scale;
+        std::vector<int32_t> mixed(count * channels, 0);
+        for (auto& pair : audioMixingBuffer_) {
+            auto& input = pair.second;
+            while (!input.samples.empty() && input.firstSample < end) {
+                size_t offset = (input.firstSample - nextAudioMixSample_) * channels;
+                for (int ch = 0; ch < channels; ++ch) {
+                    mixed[offset + ch] += input.samples.front();
+                    input.samples.pop_front();
+                }
+                ++input.firstSample;
+            }
         }
+        int32_t peak = 32767;
+        for (int32_t sample : mixed) peak = std::max(peak, std::abs(sample));
+        std::vector<int16_t> pcm(mixed.size());
+        for (size_t i = 0; i < mixed.size(); ++i)
+            pcm[i] = static_cast<int16_t>(static_cast<int64_t>(mixed[i]) * 32767 / peak);
+
+        AudioFrame frame;
+        frame.data.resize(pcm.size() * sizeof(int16_t));
+        std::memcpy(frame.data.data(), pcm.data(), frame.data.size());
+        frame.sampleRate = rate;
+        frame.channels = channels;
+        frame.timestamp = av_rescale_q(nextAudioMixSample_, {1, rate}, {1, 1000});
+        frame.valid = true;
+        if (!encodeIndividualAudioFrame(frame, compositeContext_.get(), "composite")) return false;
+        nextAudioMixSample_ = end;
     }
 
-    // Convert back to int16_t format
-    std::vector<int16_t> mixedAudioInt16(maxSamples);
-    for (size_t i = 0; i < maxSamples; i++) {
-        mixedAudioInt16[i] = static_cast<int16_t>(mixedAudio[i] * 32767.0f);
+    for (auto it = audioMixingBuffer_.begin(); it != audioMixingBuffer_.end();) {
+        if (it->second.samples.empty() && now - it->second.lastArrival > std::chrono::seconds(1))
+            it = audioMixingBuffer_.erase(it);
+        else
+            ++it;
     }
-
-    // Create AudioFrame from mixed data
-    AudioFrame mixedFrame;
-    mixedFrame.data.resize(maxSamples * sizeof(int16_t));
-    std::memcpy(mixedFrame.data.data(), mixedAudioInt16.data(), maxSamples * sizeof(int16_t));
-    mixedFrame.sampleRate = config_.audioSampleRate;
-    mixedFrame.channels = config_.audioChannels;
-    // Best Approach: RTC-Anchored with Monotonic Safety
-    // Primary: Use RTC timestamp for perfect A/V sync
-    // Fallback: Minimal increment only when RTC would go backwards
-    uint64_t rtcTimestamp = lastAudioMixTime_;  // From latest RTC frame
-
-    if (compositeContext_ && compositeContext_->lastBufferedTimestamp > 0) {
-        // Check if RTC timestamp would violate monotonic requirement
-        if (rtcTimestamp <= compositeContext_->lastBufferedTimestamp) {
-            // Minimal safety increment (1ms) to maintain monotonic progression
-            mixedFrame.timestamp = compositeContext_->lastBufferedTimestamp + 1;
-            AG_LOG_FAST(
-                INFO, "Mixed audio monotonic safety: %lu (RTC: %lu would go backwards, last: %lu)",
-                mixedFrame.timestamp, rtcTimestamp, compositeContext_->lastBufferedTimestamp);
-        } else {
-            // Use real RTC timestamp for perfect sync
-            mixedFrame.timestamp = rtcTimestamp;
-            // std::cout << "[RecordingSink] Mixed audio using RTC timestamp: " <<
-            // mixedFrame.timestamp
-            //           << std::endl;
-        }
-    } else {
-        // First frame: always use RTC timestamp
-        mixedFrame.timestamp = rtcTimestamp;
-        AG_LOG_TS(INFO, "Mixed audio first RTC timestamp: %ld", mixedFrame.timestamp);
-    }
-    mixedFrame.valid = true;
-
-    // Update lastBufferedTimestamp for next frame
-    if (compositeContext_) {
-        compositeContext_->lastBufferedTimestamp = mixedFrame.timestamp;
-    }
-
-    // Clear the buffer after mixing
-    audioMixingBuffer_.clear();
-
-    // Encode the mixed audio frame
-    return encodeIndividualAudioFrame(mixedFrame, compositeContext_.get(), "composite");
+    return true;
 }
 
 std::pair<int, int> RecordingSink::calculateOptimalLayout(int numUsers) {
@@ -1952,91 +1913,13 @@ bool RecordingSink::shouldRecordUser(const std::string& userId) const {
 }
 
 bool RecordingSink::updateCompositeFrame(const VideoFrame& frame, const std::string& userId) {
-    // std::cout << "[RecordingSink] updateCompositeFrame() - ENTRY, userId=" << userId <<
-    // std::endl; std::flush(std::cout);
-
-    {
-        // std::cout
-        //     << "[RecordingSink] updateCompositeFrame() - about to acquire compositeBufferMutex_"
-        //     << std::endl;
-        // std::flush(std::cout);
-        std::lock_guard<std::mutex> lock(compositeBufferMutex_);
-
-        // Store the latest frame from this user
-        compositeFrameBuffer_[userId] = frame;
-
-        // Track when this frame was received
-        uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                                   .count();
-        compositeFrameTimestamps_[userId] = currentTime;
-
-        // Remove old frames that are too old (frame persistence cleanup)
-        auto it = compositeFrameBuffer_.begin();
-        while (it != compositeFrameBuffer_.end()) {
-            const std::string& user = it->first;
-            uint64_t frameTime = compositeFrameTimestamps_[user];
-
-            if (currentTime - frameTime > COMPOSITE_FRAME_TIMEOUT_MS) {
-                AG_LOG_FAST(INFO, "Removing old frame for user %s (age: %lums)", user.c_str(),
-                            (currentTime - frameTime));
-                compositeFrameTimestamps_.erase(user);
-                it = compositeFrameBuffer_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // Always try to create composite frame - don't drop frames too aggressively
-    // This ensures we don't miss users' frames due to timing differences
-    uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now().time_since_epoch())
-                               .count();
-
-    // Only skip if we're processing too fast (less than 16ms = 60fps max)
-    if (currentTime - lastCompositeTime_ < 16) {
-        droppedFrames_++;
-        return true;  // Skip this frame to maintain reasonable frame rate
-    }
-
-    // Start performance measurement
-    frameProcessingStartTime_ = currentTime;
-    lastCompositeTime_ = currentTime;
-
-    // Use VideoCompositor for all video composition
-    // std::cout
-    //     << "[RecordingSink] updateCompositeFrame() - about to call
-    //     videoCompositor_->addUserFrame()"
-    //     << std::endl;
-    // std::flush(std::cout);
-
-    if (videoCompositor_) {
-        // std::cout
-        //     << "[RecordingSink] updateCompositeFrame() - calling
-        //     videoCompositor_->addUserFrame()"
-        //     << std::endl;
-        // std::flush(std::cout);
-
-        // Skip VideoCompositor if stop was requested to avoid blocking
-        if (stopRequested_.load()) {
-            // std::cout << "[RecordingSink] updateCompositeFrame() - stopRequested detected, "
-            //              "skipping VideoCompositor"
-            //           << std::endl;
-            // std::flush(std::cout);
-            return true;
-        }
-
-        bool result = videoCompositor_->addUserFrame(frame, userId);
-        // std::cout << "[RecordingSink] updateCompositeFrame() - videoCompositor_->addUserFrame() "
-        //              "returned: "
-        //           << result << std::endl;
-        // std::flush(std::cout);
-        return result;
-    } else {
+    if (stopRequested_.load()) return true;
+    if (!videoCompositor_) {
         AG_LOG_FAST(ERROR, "VideoCompositor not initialized for composite mode");
         return false;
     }
+    // Store every user's frame; the compositor limits output FPS after updating its inputs.
+    return videoCompositor_->addUserFrame(frame, userId);
 }
 
 void RecordingSink::onComposedFrame(const AVFrame* composedFrame) {
@@ -2966,6 +2849,7 @@ bool RecordingSink::writePassthroughVideoPacket(PassthroughContext* ctx, const u
     pkt->stream_index = ctx->videoStream->index;
     pkt->pts = pts;
     pkt->dts = pts;
+    pkt->duration = av_rescale_q(1, {1, config_.videoFps}, ctx->videoStream->time_base);
     if (isKeyframe) {
         pkt->flags |= AV_PKT_FLAG_KEY;
     }
@@ -2995,18 +2879,86 @@ void RecordingSink::cleanupPassthroughContext(const std::string& userId) {
     if (it == passthroughContexts_.end()) return;
 
     auto* ctx = it->second.get();
+    bool complete = ctx->headerWritten;
+
+    if (ctx->headerWritten && ctx->audioCodecContext && ctx->audioStream) {
+        if (!ctx->audioSampleBuffer.empty()) {
+            AudioFrame finalFrame;
+            std::vector<int16_t> remaining;
+            remaining.swap(ctx->audioSampleBuffer);
+            remaining.resize(ctx->audioCodecContext->frame_size * config_.audioChannels, 0);
+            finalFrame.data.resize(remaining.size() * sizeof(int16_t));
+            std::memcpy(finalFrame.data.data(), remaining.data(), finalFrame.data.size());
+            finalFrame.sampleRate = config_.audioSampleRate;
+            finalFrame.channels = config_.audioChannels;
+            finalFrame.timestamp =
+                ctx->lastBufferedTimestamp +
+                1000 * ctx->audioCodecContext->frame_size / config_.audioSampleRate;
+            complete = encodePassthroughAudioFrame(finalFrame, ctx, userId) && complete;
+        }
+        AVPacket* packet = av_packet_alloc();
+        int ret = avcodec_send_frame(ctx->audioCodecContext, nullptr);
+        if (!packet || ret < 0) {
+            complete = false;
+        } else {
+            while ((ret = avcodec_receive_packet(ctx->audioCodecContext, packet)) >= 0) {
+                packet->stream_index = ctx->audioStream->index;
+                av_packet_rescale_ts(packet, ctx->audioCodecContext->time_base,
+                                     ctx->audioStream->time_base);
+                if (av_interleaved_write_frame(ctx->formatContext, packet) < 0) complete = false;
+                av_packet_unref(packet);
+            }
+            if (ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) complete = false;
+        }
+        av_packet_free(&packet);
+    }
+
+    MetadataManager::FileInfo fileInfo;
+    fileInfo.filename = std::filesystem::path(ctx->filename).filename().string();
+    fileInfo.fullPath = ctx->filename;
+    fileInfo.type = config_.format == OutputFormat::TS ? MetadataManager::FileType::TS
+                                                       : MetadataManager::FileType::MP4;
+    fileInfo.createdAt = ctx->createdAt;
+    fileInfo.completedAt = std::chrono::system_clock::now();
+    if (ctx->videoStream) {
+        fileInfo.width = ctx->videoStream->codecpar->width;
+        fileInfo.height = ctx->videoStream->codecpar->height;
+        if (ctx->videoFrameCount > 0)
+            fileInfo.durationSeconds =
+                ctx->lastVideoPts * av_q2d(ctx->videoStream->time_base) + 1.0 / config_.videoFps;
+    }
+    if (ctx->audioFrameCount > 0 && ctx->audioFrame && ctx->audioCodecContext) {
+        fileInfo.durationSeconds =
+            std::max(fileInfo.durationSeconds,
+                     ctx->audioFrame->pts * av_q2d(ctx->audioCodecContext->time_base) +
+                         static_cast<double>(ctx->audioFrame->nb_samples) /
+                             ctx->audioCodecContext->sample_rate);
+    }
 
     if (ctx->formatContext) {
         if (ctx->headerWritten) {
-            av_write_trailer(ctx->formatContext);
+            if (av_write_trailer(ctx->formatContext) < 0) complete = false;
             AG_LOG_FAST(INFO, "Passthrough: finalized %s (%lld video frames)",
                         ctx->filename.c_str(), (long long)ctx->videoFrameCount);
         }
         if (ctx->formatContext->pb && !(ctx->formatContext->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&ctx->formatContext->pb);
+            if (avio_closep(&ctx->formatContext->pb) < 0) complete = false;
         }
         avformat_free_context(ctx->formatContext);
         ctx->formatContext = nullptr;
+    }
+
+    if (ctx->headerWritten && metadataManager_ && !config_.taskId.empty()) {
+        fileInfo.sizeBytes = getFileSize(ctx->filename);
+        fileInfo.isComplete = complete;
+        std::string outputPrefix = config_.outputDir + "/" + currentOutputFilePrefix_;
+        if (!metadataManager_->appendFileToMetadata(config_.taskId, fileInfo, outputPrefix)) {
+            AG_LOG_FAST(WARN, "Failed to add passthrough file to metadata: %s",
+                        ctx->filename.c_str());
+        }
+    }
+    if (ctx->headerWritten && !complete) {
+        AG_LOG_FAST(ERROR, "Passthrough: finalization failed for %s", ctx->filename.c_str());
     }
 
     if (ctx->audioCodecContext) {
@@ -3024,6 +2976,16 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
                                                 const std::string& userId) {
     if (!ctx || !ctx->audioCodecContext || !ctx->audioFrame || !ctx->headerWritten) {
         return false;  // Can't write audio until header is written (needs SPS/PPS first)
+    }
+    if (!ctx->hasTimeOrigin) {
+        ctx->rtcTimeOrigin = frame.timestamp;
+        ctx->hasTimeOrigin = true;
+    }
+    if (ctx->nextAudioPts == AV_NOPTS_VALUE) {
+        // Anchor AAC to the first buffered sample, rather than the callback that fills a frame.
+        int64_t elapsed =
+            static_cast<int64_t>(frame.timestamp) - static_cast<int64_t>(ctx->rtcTimeOrigin);
+        ctx->nextAudioPts = std::max<int64_t>(0, elapsed) * 90;
     }
 
     // Resampling setup (same logic as encodeIndividualAudioFrame)
@@ -3069,15 +3031,7 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
         return true;  // Buffering
     }
 
-    // Initialize time origin if needed
-    if (!ctx->hasTimeOrigin) {
-        ctx->rtcTimeOrigin = frame.timestamp;
-        ctx->hasTimeOrigin = true;
-    }
-
-    // Calculate PTS in 90kHz timebase
-    uint64_t elapsed_ms = frame.timestamp - ctx->rtcTimeOrigin;
-    int64_t pts = static_cast<int64_t>(elapsed_ms) * 90;  // ms → 90kHz
+    int64_t pts = ctx->nextAudioPts;
 
     // Set up audio frame
     ctx->audioFrame->nb_samples = samples_per_frame;
@@ -3122,6 +3076,7 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
     }
 
     ctx->audioFrameCount++;
+    ctx->nextAudioPts += av_rescale_q(samples_per_frame, {1, config_.audioSampleRate}, {1, 90000});
 
     // Encode and write
     AVPacket* packet = av_packet_alloc();
@@ -3248,11 +3203,23 @@ void RecordingSink::audioProcessingThreadLoop() {
 
     while (!stopRequested_.load()) {
         std::unique_lock<std::mutex> lock(audioQueueMutex_);
-        audioQueueCv_.wait(lock,
-                           [this] { return stopRequested_.load() || !audioFrameQueue_.empty(); });
+        audioQueueCv_.wait_for(lock, std::chrono::milliseconds(10), [this] {
+            return stopRequested_.load() || !audioFrameQueue_.empty();
+        });
         lock.unlock();
 
         processAudioFrames();
+        if (config_.mode == VideoCompositor::Mode::Composite && config_.recordAudio &&
+            !createMixedAudioFrame()) {
+            AG_LOG_TS(WARN, "Failed to encode mixed audio");
+        }
+    }
+
+    // Producers stop accepting frames before shutdown; drain accepted PCM before finalizing AAC.
+    processAudioFrames();
+    if (config_.mode == VideoCompositor::Mode::Composite && config_.recordAudio &&
+        !createMixedAudioFrame(true)) {
+        AG_LOG_TS(WARN, "Failed to flush mixed audio");
     }
 
     AG_LOG_FAST(INFO, "Audio processing thread exiting");

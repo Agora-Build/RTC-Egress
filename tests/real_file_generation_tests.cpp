@@ -507,6 +507,7 @@ TEST_F(RealFileGenerationTest, RealMultiUserCompositeRecording) {
 
     const int frameCount = 90;  // 3 seconds
     const uint64_t frameInterval = 33;
+    const int audioSamples = 48000 * frameInterval / 1000;
 
     std::atomic<int> totalFramesSent{0};
 
@@ -520,8 +521,8 @@ TEST_F(RealFileGenerationTest, RealMultiUserCompositeRecording) {
 
                 auto videoFrame = generator_->generateVideoFrame(users[userIdx], timestamp, 640,
                                                                  480, patterns[userIdx]);
-                auto audioBuffer = generator_->generateAudioFrame(users[userIdx], timestamp, 960,
-                                                                  48000, 2, 440.0f + userIdx * 100);
+                auto audioBuffer = generator_->generateAudioFrame(
+                    users[userIdx], timestamp, audioSamples, 48000, 2, 440.0f + userIdx * 100);
 
                 // Generate raw YUV data for user frame
                 std::vector<uint8_t> yBuffer(640 * 480);
@@ -565,7 +566,7 @@ TEST_F(RealFileGenerationTest, RealMultiUserCompositeRecording) {
                                            320,  // strides
                                            640, 480, timestamp, users[userIdx]);
 
-                recordingSink.onAudioFrame(audioBuffer.data(), 960, 48000, 2, timestamp,
+                recordingSink.onAudioFrame(audioBuffer.data(), audioSamples, 48000, 2, timestamp,
                                            users[userIdx]);
 
                 totalFramesSent++;
@@ -582,7 +583,7 @@ TEST_F(RealFileGenerationTest, RealMultiUserCompositeRecording) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // Allow composition to finish
     recordingSink.stop();
 
-    // Verify composite MP4 was created
+    // Validate the actual streams; compression and correct mixing make file size unpredictable.
     bool foundComposite = false;
     size_t compositeSize = 0;
 
@@ -591,9 +592,40 @@ TEST_F(RealFileGenerationTest, RealMultiUserCompositeRecording) {
             foundComposite = true;
             compositeSize = std::filesystem::file_size(entry.path());
 
-            // Composite video should be larger due to multiple users
-            EXPECT_GT(compositeSize, 150000);    // At least 150KB (adjusted from 200KB)
-            EXPECT_LT(compositeSize, 10000000);  // Less than 10MB
+            EXPECT_GT(compositeSize, 0u);
+            AVFormatContext* input = nullptr;
+            ASSERT_EQ(avformat_open_input(&input, entry.path().c_str(), nullptr, nullptr), 0);
+            ASSERT_EQ(avformat_find_stream_info(input, nullptr), 0);
+            int video = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            int audio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            ASSERT_GE(video, 0);
+            ASSERT_GE(audio, 0);
+            EXPECT_EQ(input->streams[video]->codecpar->codec_id, AV_CODEC_ID_H264);
+            EXPECT_EQ(input->streams[audio]->codecpar->codec_id, AV_CODEC_ID_AAC);
+            EXPECT_EQ(input->streams[video]->codecpar->width, 1920);
+            EXPECT_EQ(input->streams[video]->codecpar->height, 1080);
+            double videoDuration =
+                input->streams[video]->duration * av_q2d(input->streams[video]->time_base);
+            double audioDuration =
+                input->streams[audio]->duration * av_q2d(input->streams[audio]->time_base);
+            EXPECT_NEAR(videoDuration, frameCount * frameInterval / 1000.0, 0.2);
+            EXPECT_NEAR(audioDuration, videoDuration, 0.1);
+            std::vector<int> packets(input->nb_streams, 0);
+            std::vector<int64_t> lastDts(input->nb_streams, AV_NOPTS_VALUE);
+            AVPacket* packet = av_packet_alloc();
+            ASSERT_NE(packet, nullptr);
+            while (av_read_frame(input, packet) >= 0) {
+                int stream = packet->stream_index;
+                ++packets[stream];
+                if (lastDts[stream] != AV_NOPTS_VALUE && packet->dts != AV_NOPTS_VALUE)
+                    EXPECT_GT(packet->dts, lastDts[stream]);
+                lastDts[stream] = packet->dts;
+                av_packet_unref(packet);
+            }
+            EXPECT_GT(packets[video], 50);
+            EXPECT_GT(packets[audio], 100);
+            av_packet_free(&packet);
+            avformat_close_input(&input);
             break;
         }
     }
