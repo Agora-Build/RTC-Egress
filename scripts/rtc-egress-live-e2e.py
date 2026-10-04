@@ -562,6 +562,7 @@ def main():
     API_URL = 'http://127.0.0.1:18091/egress/v1/' + APP_ID
     for port in [18091, 18191, 18192]:
         with socket.socket() as test_socket:
+            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             test_socket.bind(('127.0.0.1', port))
     for entry in Path('/proc').iterdir():
         try:
