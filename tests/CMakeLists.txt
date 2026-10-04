@@ -225,6 +225,7 @@ add_test(NAME SnapshotFilterTests COMMAND snapshot_filter_tests)
 
 add_executable(recording_thread_tests
     recording_thread_tests.cpp
+    recording_media_tests.cpp
     ../src/recording_sink.cpp
     ../src/snapshot_sink.cpp
     ../src/video_compositor.cpp

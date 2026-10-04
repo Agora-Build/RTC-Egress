@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <map>
 #include <memory>
@@ -140,7 +141,7 @@ class RecordingSink {
 
     // Audio mixing methods
     bool mixAudioFromMultipleUsers(const AudioFrame& frame, const std::string& userId);
-    bool createMixedAudioFrame();
+    bool createMixedAudioFrame(bool flush = false);
 
     // Layout calculation methods
     std::pair<int, int> calculateOptimalLayout(int numUsers);
@@ -153,8 +154,11 @@ class RecordingSink {
         AVStream* audioStream = nullptr;
         AVCodecContext* audioCodecContext = nullptr;
         SwrContext* swrContext = nullptr;
+        int inputSampleRate = 0;
+        int inputChannels = 0;
         AVFrame* audioFrame = nullptr;
         std::string filename;
+        std::chrono::system_clock::time_point createdAt = std::chrono::system_clock::now();
         bool headerWritten = false;
         bool extraDataSet = false;
         bool isHevc = false;  // true for H265/HEVC, false for H264
@@ -164,6 +168,7 @@ class RecordingSink {
         bool hasTimeOrigin = false;
         int64_t lastVideoPts = -1;
         int64_t lastAudioPts = -1;
+        int64_t nextAudioPts = AV_NOPTS_VALUE;
         std::vector<int16_t> audioSampleBuffer;
         uint64_t lastBufferedTimestamp = 0;
     };
@@ -267,6 +272,8 @@ class RecordingSink {
     void cleanupPassthroughContext(const std::string& userId);
     bool encodePassthroughAudioFrame(const AudioFrame& frame, PassthroughContext* ctx,
                                      const std::string& userId);
+    bool writePassthroughAudioSamples(PassthroughContext* ctx, const std::string& userId,
+                                      bool flushPartial);
 
     // Utilities
     std::string generateOutputFilename(const std::string& userId = "");
@@ -319,13 +326,26 @@ class RecordingSink {
     std::map<std::string, uint64_t>
         compositeFrameTimestamps_;  // Track when each frame was received
     std::mutex compositeBufferMutex_;
-    const uint64_t COMPOSITE_FRAME_TIMEOUT_MS = 1000;  // Keep frames for 1 second
 
     // Audio mixing for composite mode
-    std::map<std::string, std::vector<float>> audioMixingBuffer_;  // Per-user audio buffer
+    struct ResamplerDeleter {
+        void operator()(SwrContext* context) const {
+            swr_free(&context);
+        }
+    };
+    struct AudioMixInput {
+        std::deque<int16_t> samples;
+        int64_t firstSample = -1;
+        int sampleRate = 0;
+        int channels = 0;
+        std::unique_ptr<SwrContext, ResamplerDeleter> resampler;
+        std::chrono::steady_clock::time_point lastArrival;
+    };
+    std::map<std::string, AudioMixInput> audioMixingBuffer_;
     std::mutex audioMixingMutex_;
-    uint64_t lastAudioMixTime_ = 0;
-    const uint64_t AUDIO_MIX_INTERVAL_MS = 20;  // Mix audio every 20ms
+    int64_t nextAudioMixSample_ = -1;
+    std::chrono::steady_clock::time_point audioMixStart_;
+    static constexpr int AUDIO_MIX_WAIT_MS = 40;
 
     // Performance optimizations
     std::map<std::string, SwsContext*> userScalingContexts_;  // Cached scaling contexts
@@ -341,9 +361,6 @@ class RecordingSink {
     uint64_t frameProcessingCount_ = 0;
     uint64_t lastPerformanceCheck_ = 0;
     uint64_t droppedFrames_ = 0;
-
-    // Audio mixing
-    float maxAudioLevel_ = 0.0f;
 
     // Layout caching
     size_t lastLayoutUserCount_ = 0;
