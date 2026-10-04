@@ -1,0 +1,31 @@
+name: Review Workflow Tests
+
+on:
+  pull_request:
+    paths: ['.github/**']
+  push:
+    branches: [main]
+    paths: ['.github/**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Test review output parsing and publication
+        run: node --test .github/scripts/review-output.test.cjs
+      - name: Validate review workflows
+        run: >-
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck=
+          .github/workflows/codex-code-review.yml
+          .github/workflows/claude-code-review.yml
+          .github/workflows/review-workflow-tests.yml
