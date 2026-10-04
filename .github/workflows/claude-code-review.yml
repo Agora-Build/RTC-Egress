@@ -113,6 +113,7 @@ jobs:
           path: ${{ runner.temp }}/claude-review.md
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
   # Only this job can post comments; it runs no model and receives no provider key.
   post:
@@ -126,7 +127,7 @@ jobs:
       - name: Checkout review publisher
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           sparse-checkout: .github/scripts
           persist-credentials: false
 
@@ -142,8 +143,9 @@ jobs:
           script: |
             const { readReview, postReview } = require('./.github/scripts/review-output.cjs');
             await postReview({ github, context }, {
-              reviewer: 'Claude', headSha: process.env.PR_HEAD_SHA,
+              reviewer: 'Claude', headSha: process.env.PR_HEAD_SHA, mergeSha: process.env.PR_MERGE_SHA,
               review: readReview('review-output', 'markdown'),
             });
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_MERGE_SHA: ${{ github.sha }}

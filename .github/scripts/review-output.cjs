@@ -36,9 +36,9 @@ function readReview(directory, format) {
   return parseReview(fs.readFileSync(path.join(directory, files[0].name), 'utf8'), format);
 }
 
-async function postReview({ github, context }, { reviewer, headSha, review }) {
+async function postReview({ github, context }, { reviewer, headSha, mergeSha, review }) {
   const text = parseReview(review, 'markdown');
-  const body = `## \u{1F916} ${reviewer} Code Review\n\nReviewed commit: \`${headSha}\`\n\n${text}`;
+  const body = `## \u{1F916} ${reviewer} Code Review\n\nPR head: \`${headSha}\`\nReviewed merge: \`${mergeSha}\`\n\n${text}`;
   if ([...body].length > 65536) {
     throw new Error('Review output is too long for a GitHub comment.');
   }

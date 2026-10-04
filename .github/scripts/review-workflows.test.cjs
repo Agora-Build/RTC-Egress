@@ -77,6 +77,12 @@ for (const name of ['codex', 'claude']) {
   test(`${name} review checkout uses the immutable event merge SHA`, () => {
     assert.match(workflow, /- name: Checkout repository\n\s+uses: actions\/checkout@v5\n\s+with:\n\s+ref: \$\{\{ github.sha \}\}/);
   });
+
+  test(`${name} publisher uses the same immutable merge and handles workflow reruns`, () => {
+    assert.match(workflow, /- name: Checkout review publisher\n\s+uses: actions\/checkout@v5\n\s+with:\n\s+ref: \$\{\{ github.sha \}\}/);
+    assert.ok(workflow.includes('overwrite: true'));
+    assert.ok(workflow.includes('PR_MERGE_SHA: ${{ github.sha }}'));
+  });
 }
 
 const codex = fs.readFileSync(path.join(root, '.github/workflows/codex-code-review.yml'), 'utf8');

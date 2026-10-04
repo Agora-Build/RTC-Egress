@@ -3,7 +3,7 @@
 RTC-Egress runs Codex and Claude reviews when a pull request is opened,
 updated, reopened, or marked ready for review. Each reviewer posts an ordinary
 PR comment containing findings or an explicit statement that it found no
-actionable issues, together with the reviewed head commit SHA. These comments
+actionable issues, together with both the PR head SHA and the reviewed merge SHA. These comments
 are separate from GitHub approval reviews and production build/test checks.
 
 ## Configuration
@@ -24,6 +24,9 @@ credential sent to the default OpenAI endpoint can fail authentication even
 when the credential works with its intended provider. Missing configuration
 fails before either model starts, with the missing secret's name.
 
+The optional repository variable `CODEX_REVIEW_MODEL` overrides the model name
+without changing the workflow. It defaults to Vox's `gpt-5.6-sol`.
+
 To configure the URL interactively without putting it in shell history:
 
 ```sh
@@ -42,8 +45,8 @@ Do not put credential values in documentation, review artifacts, or memory.
    summary as untrusted context.
 2. The model job has `contents: read` and `pull-requests: read`. It receives its
    provider configuration and produces an artifact; it cannot post a review.
-3. A separate job downloads the artifact, reads the publisher from the triggering
-   PR head, validates the result, and posts the comment. It has PR write access
+3. A separate job downloads the artifact, reads the publisher from the same
+   immutable merge SHA, validates the result, and posts the comment. It has PR write access
    and receives no provider credentials. The publisher treats model output as
    text and never executes it.
 
@@ -52,7 +55,7 @@ GitHub's API. Provider-backed reviews run only for same-repository PRs whose
 author has `admin` or `write` permission. GitHub reports the `maintain` role as
 `write` and the `triage` role as `read`. Fork PRs and other authors are skipped.
 An author-access 404 also skips the review; other API failures fail authorization.
-The publisher also runs code from that trusted PR, so this author restriction
+The publisher also runs code from that trusted PR's merge, so this author restriction
 applies to both model access and publication. The standalone workflow tests
 run without provider credentials, including on fork PRs.
 
@@ -61,12 +64,14 @@ completed result from the action's execution JSON and uploads only the final
 Markdown in `claude-review-output`. Artifacts expire after seven days. The full
 Claude execution transcript is not uploaded, and assistant messages without a
 completed result fail extraction instead of being posted as a partial review.
+Uploads overwrite earlier artifacts from the same workflow run so full reruns
+do not collide with the previous attempt's artifact name.
 
 A missing artifact, malformed JSON, failed Claude result, empty review, or
 GitHub publication error fails the workflow. Empty output cannot silently
 produce a successful review check. Oversized comments fail instead of being
 silently truncated. Concurrent runs for an updated PR cancel older runs, and
-the comment's head SHA identifies which version was reviewed.
+the comment's head and merge SHAs identify the PR version and exact tree reviewed.
 
 ## Action Version And Timeouts
 
@@ -104,7 +109,7 @@ mocks, run the provider configuration step with fixture URLs, and check the
 literal-SHA diff prompt.
 
 For a live PR, check that both `review` and `post` jobs succeed and that both
-comments name the current PR head SHA. An artifact or a successful model step
+comments name the current PR head SHA and the workflow's merge SHA. An artifact or a successful model step
 alone does not prove that the review was published. For authentication errors,
 check the provider URL, credential, and model together. For publication errors,
 check the `post` job and the review artifact without exposing credentials.

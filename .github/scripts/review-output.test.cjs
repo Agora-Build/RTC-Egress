@@ -92,14 +92,14 @@ test('missing output artifact fails', () => {
   assert.throws(() => readReview(path.join(os.tmpdir(), 'missing-review-' + process.pid), 'markdown'), /ENOENT/);
 });
 
-test('publisher posts the exact review and records the reviewed head commit', async () => {
+test('publisher posts the exact review and records both head and reviewed merge commits', async () => {
   let comment;
   const github = { rest: { issues: { createComment: async (input) => { comment = input; } } } };
   const context = { repo: { owner: 'Agora-Build', repo: 'RTC-Egress' }, payload: { pull_request: { number: 6 } } };
-  await postReview({ github, context }, { reviewer: 'Codex', headSha: 'abc123', review: 'No actionable findings.' });
+  await postReview({ github, context }, { reviewer: 'Codex', headSha: 'abc123', mergeSha: 'def456', review: 'No actionable findings.' });
   assert.deepEqual(comment, {
     owner: 'Agora-Build', repo: 'RTC-Egress', issue_number: 6,
-    body: '## \u{1F916} Codex Code Review\n\nReviewed commit: `abc123`\n\nNo actionable findings.',
+    body: '## \u{1F916} Codex Code Review\n\nPR head: `abc123`\nReviewed merge: `def456`\n\nNo actionable findings.',
   });
 });
 
