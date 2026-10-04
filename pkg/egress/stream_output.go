@@ -7,35 +7,44 @@ import (
 	"strings"
 )
 
-func readStreamOutput(payload map[string]interface{}) (string, string, int, error) {
-	var destination, token string
-	timeout := 5000
+type streamOutputSettings struct {
+	destination, token       string
+	timeout, attempts, delay int
+}
+
+func readStreamOutput(payload map[string]interface{}) (streamOutputSettings, error) {
+	settings := streamOutputSettings{timeout: 5000, attempts: 5, delay: 1000}
 	for _, field := range []struct {
 		name  string
 		value interface{}
 	}{
-		{"output_url", &destination}, {"output_token", &token}, {"output_timeout_ms", &timeout},
+		{"output_url", &settings.destination}, {"output_token", &settings.token}, {"output_timeout_ms", &settings.timeout},
+		{"output_reconnect_attempts", &settings.attempts}, {"output_reconnect_delay_ms", &settings.delay},
 	} {
 		if value, exists := payload[field.name]; exists {
+			if value == nil {
+				return settings, fmt.Errorf("invalid %s", field.name)
+			}
 			data, err := json.Marshal(value)
 			if err != nil {
-				return "", "", 0, fmt.Errorf("invalid %s", field.name)
+				return settings, fmt.Errorf("invalid %s", field.name)
 			}
 			if err := json.Unmarshal(data, field.value); err != nil {
-				return "", "", 0, fmt.Errorf("invalid %s", field.name)
+				return settings, fmt.Errorf("invalid %s", field.name)
 			}
 		}
 	}
-	return destination, token, timeout, nil
+	return settings, nil
 }
 
-func validateStreamOutput(cmd, layout, destination, token string, timeout int) error {
+func validateStreamOutput(cmd, layout string, settings streamOutputSettings) error {
 	if cmd != "rtmp" && cmd != "whip" {
 		return nil
 	}
 	if layout == "freestyle" {
 		return fmt.Errorf("native streaming does not support freestyle layout")
 	}
+	destination, token, timeout := settings.destination, settings.token, settings.timeout
 	parsed, err := url.Parse(destination)
 	if err != nil || parsed.Hostname() == "" || parsed.Fragment != "" || strings.ContainsAny(destination, "\r\n\t ") {
 		return fmt.Errorf("output_url must be a valid streaming destination")
@@ -57,6 +66,12 @@ func validateStreamOutput(cmd, layout, destination, token string, timeout int) e
 	}
 	if timeout < 1000 || timeout > 30000 {
 		return fmt.Errorf("output_timeout_ms must be between 1000 and 30000")
+	}
+	if settings.attempts < 0 || settings.attempts > 20 {
+		return fmt.Errorf("output_reconnect_attempts must be between 0 and 20")
+	}
+	if settings.delay < 100 || settings.delay > 10000 {
+		return fmt.Errorf("output_reconnect_delay_ms must be between 100 and 10000")
 	}
 	return nil
 }

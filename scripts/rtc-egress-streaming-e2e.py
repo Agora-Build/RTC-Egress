@@ -3,7 +3,8 @@
 
 Build tests/ with FFmpeg 8 using CMake first. Supply a MediaMTX v1.21.1 binary
 with --receiver. Tests RTMP H264/AAC and WHIP H264/Opus with one and two users,
-decoded colors/tones, WHIP session cleanup, and RTMP receiver disconnection.
+decoded colors/tones, fresh sessions after receiver restarts, bounded retries,
+stop cancellation, task duration deadlines, and WHIP session cleanup.
 Artifacts are kept in /tmp; no existing services or recordings are modified.
 """
 
@@ -27,7 +28,7 @@ def probe(file):
     return json.loads(result.stdout)
 
 
-def verify(file, protocol, users, seconds, artifact):
+def verify(file, protocol, users, seconds, artifact, fresh=False):
     info = probe(file)
     (artifact / 'probe.json').write_text(json.dumps(info, indent=2) + '\n')
     video = next(item for item in info['streams'] if item['codec_type'] == 'video')
@@ -36,6 +37,19 @@ def verify(file, protocol, users, seconds, artifact):
     assert audio['codec_name'] == ('opus' if protocol == 'whip' else 'aac'), audio
     duration = float(info['format']['duration'])
     assert duration >= seconds - 2, duration
+    packets = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                              '-read_intervals', '%+2', '-show_packets', '-of', 'json', str(file)],
+                             check=True, capture_output=True)
+    video_packets = json.loads(packets.stdout)['packets']
+    first = video_packets[0]
+    # MediaMTX can drop the initial IDR if audio starts its fMP4 segment a few us later.
+    # Require a promptly usable keyframe, while checking the fresh origin separately.
+    first_key = next(packet for packet in video_packets if 'K' in packet['flags'])
+    assert float(first_key['pts_time']) < 1.5, first_key
+    # Initial fixtures deliberately start audio 400 ms before video; recovery should start fresh.
+    start_limit = 0.25 if fresh else 0.6
+    assert abs(float(first['pts_time'])) < start_limit, first
+    assert abs(float(video.get('start_time', 0)) - float(audio.get('start_time', 0))) < start_limit, info
     subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-i', str(file),
                     '-fps_mode', 'passthrough', '-enc_time_base:v', '-1', '-f', 'null', '-'],
                    check=True, capture_output=True, timeout=30)
@@ -69,7 +83,8 @@ def verify(file, protocol, users, seconds, artifact):
     assert tones['440'] > 500, tones
     assert (tones['880'] > 500 if users == 2 else tones['880'] < 100), tones
     return {'duration': duration, 'video': video['codec_name'], 'audio': audio['codec_name'],
-            'colors': counts, 'tones': tones}
+            'colors': counts, 'tones': tones, 'first_video_packet': first,
+            'first_keyframe': first_key}
 
 
 def stop(process):
@@ -102,50 +117,94 @@ def sessions():
         return json.load(response)['items']
 
 
+def wait_log(process, log, text, timeout=10):
+    deadline = time.monotonic() + timeout
+    while text not in log.read_text():
+        if process.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError('Publisher did not report ' + text + ': ' + str(log))
+        time.sleep(0.05)
+
+
+def destination(protocol, name):
+    return ('rtmp://127.0.0.1:18235/' + name if protocol == 'rtmp'
+            else 'http://127.0.0.1:18289/' + name + '/whip')
+
+
+def wait_media(process, name, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and process.poll() is None:
+        with urllib.request.urlopen('http://127.0.0.1:18297/v3/paths/list', timeout=2) as response:
+            if any(item['name'] == name and item.get('ready') for item in json.load(response)['items']):
+                return
+        time.sleep(0.1)
+    raise RuntimeError('Receiver did not receive media: ' + name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--receiver', type=Path, required=True)
     parser.add_argument('--fixture', type=Path, default=PROJECT / 'build/tests-whip/streaming_media_fixture')
     parser.add_argument('--seconds', type=int, default=6)
+    parser.add_argument('--filter', default='', help='Run cases matching any comma-separated substring')
     args = parser.parse_args()
-    if args.seconds < 4:
-        parser.error('--seconds must be at least 4')
+    if args.seconds < 4 or args.seconds > 52:
+        parser.error('--seconds must be between 4 and 52')
     root = Path('/tmp') / ('rtc-egress-streaming-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     root.mkdir(mode=0o700)
     print('Artifacts: ' + str(root), flush=True)
     for port in [18235, 18289, 18297]:
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('127.0.0.1', port))
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(('127.0.0.1', 18290))
     config = root / 'receiver.json'
     config.write_text(json.dumps(receiver_config(root), indent=2) + '\n')
     results = []
+    expected = 0
     receiver = publisher = None
-    try:
-        with (root / 'receiver.log').open('w') as output:
-            receiver = subprocess.Popen([str(args.receiver.resolve()), str(config)], cwd=root, stdout=output, stderr=subprocess.STDOUT)
+
+    def selected(name):
+        return not args.filter or any(part in name for part in args.filter.split(','))
+
+    def start_receiver():
+        nonlocal receiver
+        with (root / 'receiver.log').open('a') as output:
+            receiver = subprocess.Popen([str(args.receiver.resolve()), str(config)], cwd=root,
+                                        stdout=output, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 10
         while True:
             try:
                 sessions()
-                break
-            except Exception:
+                return
+            except (OSError, ValueError):
                 if receiver.poll() is not None or time.monotonic() >= deadline:
                     details = (root / 'receiver.log').read_text()[-2000:]
                     raise RuntimeError('Receiver failed to become ready:\n' + details)
                 time.sleep(0.1)
+
+    def start_publisher(case, protocol, users, seconds, attempts=5, delay=1000,
+                        max_seconds=28800, timeout=2000):
+        nonlocal publisher
+        with (case / 'publisher.log').open('w') as output:
+            publisher = subprocess.Popen([str(args.fixture.resolve()), protocol,
+                                          destination(protocol, case.name), str(users), str(seconds),
+                                          str(attempts), str(delay), str(max_seconds), str(timeout)],
+                                         cwd=case, stdout=output, stderr=subprocess.STDOUT)
+        wait_log(publisher, case / 'publisher.log', 'ready\n')
+
+    try:
+        start_receiver()
         for protocol in ['rtmp', 'whip']:
             for users in [1, 2]:
                 name = protocol + '_' + str(users) + '_users'
+                if not selected(name):
+                    continue
+                expected += 1
                 case = root / name
                 case.mkdir()
-                url = ('rtmp://127.0.0.1:18235/' + name if protocol == 'rtmp'
-                       else 'http://127.0.0.1:18289/' + name + '/whip')
-                with (case / 'publisher.log').open('w') as output:
-                    result = subprocess.run([str(args.fixture.resolve()), protocol, url, str(users), str(args.seconds)],
-                                            cwd=case, stdout=output, stderr=subprocess.STDOUT, timeout=args.seconds + 12)
-                assert result.returncode == 0, 'Publishing failed: ' + str(case / 'publisher.log')
+                start_publisher(case, protocol, users, args.seconds)
+                assert publisher.wait(timeout=args.seconds + 12) == 0, 'Publishing failed: ' + str(case / 'publisher.log')
                 time.sleep(0.5)
                 files = list((root / 'received' / name).glob('*.mp4'))
                 assert len(files) == 1, files
@@ -154,23 +213,85 @@ def main():
                     assert not sessions(), 'WHIP session remained after stop'
                 results.append({'case': name, 'status': 'PASS', 'metrics': metrics})
                 print('PASS ' + name + ': ' + json.dumps(metrics), flush=True)
-        case = root / 'rtmp_disconnect'
-        case.mkdir()
-        with (case / 'publisher.log').open('w') as output:
-            publisher = subprocess.Popen([str(args.fixture.resolve()), 'rtmp',
-                                           'rtmp://127.0.0.1:18235/disconnect', '2', '20'],
-                                          cwd=case, stdout=output, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + 10
-        while 'ready\n' not in (case / 'publisher.log').read_text():
-            if publisher.poll() is not None or time.monotonic() >= deadline:
-                raise RuntimeError('Disconnect publisher did not start')
-            time.sleep(0.1)
-        time.sleep(2)
-        stopped = time.monotonic()
-        stop(receiver)
-        assert publisher.wait(timeout=6) == 1, 'Receiver disconnect was not reported as failure'
-        results.append({'case': 'rtmp_disconnect', 'status': 'PASS', 'failure_latency': time.monotonic() - stopped})
-        print('PASS rtmp_disconnect', flush=True)
+        for protocol in ['rtmp', 'whip']:
+            for users in [1, 2]:
+                name = protocol + '_restart_' + str(users) + '_users'
+                if not selected(name):
+                    continue
+                expected += 1
+                case = root / name
+                case.mkdir()
+                start_publisher(case, protocol, users, args.seconds + 8, delay=500)
+                wait_media(publisher, name)
+                time.sleep(1.2)
+                stop(receiver)
+                wait_log(publisher, case / 'publisher.log', 'reconnecting\n')
+                time.sleep(0.7)
+                assert publisher.poll() is None, 'Publisher exited during outage'
+                start_receiver()
+                wait_log(publisher, case / 'publisher.log', 'recovered\n')
+                assert publisher.wait(timeout=args.seconds + 12) == 0, 'Publisher failed to recover'
+                time.sleep(0.5)
+                files = sorted((root / 'received' / name).glob('*.mp4'))
+                assert len(files) == 2, files
+                metrics = verify(files[-1], protocol, users, args.seconds, case, fresh=True)
+                if protocol == 'whip':
+                    assert not sessions(), 'Recovered WHIP session remained after stop'
+                results.append({'case': name, 'status': 'PASS', 'metrics': metrics})
+                print('PASS ' + name + ': ' + json.dumps(metrics), flush=True)
+
+            for scenario in ['exhaustion', 'disabled', 'stop_delay', 'stop_handshake',
+                             'duration_delay', 'duration_handshake']:
+                name = protocol + '_' + scenario
+                if not selected(name):
+                    continue
+                expected += 1
+                case = root / name
+                case.mkdir()
+                attempts = 0 if scenario == 'disabled' else 2
+                delay = 5000 if scenario.endswith('_delay') else 100
+                max_seconds = 5 if scenario.startswith('duration_') else 28800
+                timeout = 30000 if scenario.endswith('_handshake') else 2000
+                start_publisher(case, protocol, 2, 30, attempts, delay, max_seconds, timeout)
+                time.sleep(2)
+                stopped = time.monotonic()
+                stop(receiver)
+                log = case / 'publisher.log'
+                if scenario.endswith('_handshake'):
+                    # Accept TCP without answering RTMP/HTTP, so a reconnect handshake stalls.
+                    with socket.socket() as server:
+                        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        server.bind(('127.0.0.1', 18235 if protocol == 'rtmp' else 18289))
+                        server.listen(1)
+                        server.settimeout(5)
+                        client, _ = server.accept()
+                        with client:
+                            if scenario == 'stop_handshake':
+                                stopped = time.monotonic()
+                                publisher.terminate()
+                            assert publisher.wait(timeout=6) == 0, 'Stalled reconnect did not stop'
+                elif scenario == 'stop_delay':
+                    wait_log(publisher, log, 'reconnecting\n')
+                    stopped = time.monotonic()
+                    publisher.terminate()
+                    assert publisher.wait(timeout=3) == 0, 'Retry delay did not stop'
+                else:
+                    expected_code = 0 if scenario.startswith('duration_') else 1
+                    assert publisher.wait(timeout=8) == expected_code, 'Unexpected completion: ' + str(log)
+                latency = time.monotonic() - stopped
+                content = log.read_text()
+                if scenario.startswith('stop_'):
+                    assert latency < 2, latency
+                    assert 'complete ' not in content, content
+                elif scenario.startswith('duration_'):
+                    assert 'complete success Streaming duration reached' in content, content
+                else:
+                    assert 'complete failed Streaming destination reconnect exhausted after ' + str(attempts) + ' attempts' in content, content
+                    assert content.count('reconnect attempt ') == attempts, content
+                start_receiver()
+                assert not sessions(), 'WHIP session remained after terminal completion'
+                results.append({'case': name, 'status': 'PASS', 'completion_latency': latency})
+                print('PASS ' + name + ': ' + str(round(latency, 3)) + 's', flush=True)
     except Exception as error:
         results.append({'case': 'run', 'status': 'FAIL', 'error': str(error)})
         print('FAIL: ' + str(error), flush=True)
@@ -178,7 +299,7 @@ def main():
         stop(publisher)
         stop(receiver)
         (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-    return 0 if len(results) == 5 and all(item['status'] == 'PASS' for item in results) else 1
+    return 0 if expected and len(results) == expected and all(item['status'] == 'PASS' for item in results) else 1
 
 
 if __name__ == '__main__':

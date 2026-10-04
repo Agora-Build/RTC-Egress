@@ -6,6 +6,10 @@
 
 #include "common/log.h"
 
+extern "C" {
+#include <libavutil/time.h>
+}
+
 namespace agora::rtc {
 
 StreamingSink::~StreamingSink() {
@@ -23,7 +27,9 @@ bool StreamingSink::initialize(const Config& config) {
     initialized_ = false;
     if (!StreamingOutput::validate(config.output) || config.width < 2 || config.height < 2 ||
         config.width > 8192 || config.height > 8192 || config.width % 2 || config.height % 2 ||
-        config.fps < 1 || config.fps > 60 || config.maxDurationSeconds < 1)
+        config.fps < 1 || config.fps > 60 || config.maxDurationSeconds < 1 ||
+        config.reconnectAttempts < 0 || config.reconnectAttempts > 20 ||
+        config.reconnectDelayMs < 100 || config.reconnectDelayMs > 10000)
         return false;
     config_ = config;
     VideoCompositor::Config layout;
@@ -62,6 +68,26 @@ bool StreamingSink::start() {
     if (!initialized_ || active_ || thread_.joinable()) return false;
     stopping_ = false;
     failed_ = false;
+    reconnecting_ = false;
+    failureMessage_ = "Streaming media processing failed";
+    taskDeadline_ =
+        std::chrono::steady_clock::now() + std::chrono::seconds(config_.maxDurationSeconds);
+    taskDeadlineUs_ =
+        av_gettime_relative() + static_cast<int64_t>(config_.maxDurationSeconds) * 1000000;
+    if (!openSession()) {
+        failed_ = !stopping_.load();
+        output_.close();
+        releaseCodecs();
+        return false;
+    }
+    active_ = true;
+    thread_ = std::thread(&StreamingSink::run, this);
+    return true;
+}
+
+bool StreamingSink::openSession() {
+    outputFailed_ = false;
+    if (stopping_ || durationReached()) return false;
     hasOrigin_ = false;
     lastVideoPts_ = -1;
     nextAudioPts_ = AV_NOPTS_VALUE;
@@ -79,16 +105,57 @@ bool StreamingSink::start() {
         audio.codec = "libopus";
         audio.sampleFormat = AV_SAMPLE_FMT_FLT;
     }
-    if (!MediaEncoder::openVideo(&video_, video) || !MediaEncoder::openAudio(&audio_, audio) ||
-        !output_.open(config_.output, video_, audio_)) {
-        failed_ = true;
-        output_.close();
-        releaseCodecs();
+    if (!MediaEncoder::openVideo(&video_, video) || !MediaEncoder::openAudio(&audio_, audio))
+        return false;
+    if (!output_.open(config_.output, video_, audio_, &stopping_, taskDeadlineUs_)) {
+        outputFailed_ = true;
         return false;
     }
-    active_ = true;
-    thread_ = std::thread(&StreamingSink::run, this);
+    // Never replay audio accumulated while the destination was unavailable.
+    mixer_.reset();
     return true;
+}
+
+bool StreamingSink::durationReached() const {
+    return std::chrono::steady_clock::now() >= taskDeadline_;
+}
+
+bool StreamingSink::reconnect() {
+    reconnecting_ = true;
+    output_.close();
+    releaseCodecs();
+    int delayMs = config_.reconnectDelayMs;
+    for (int attempt = 1; attempt <= config_.reconnectAttempts; ++attempt) {
+        AG_LOG(WARN, "Streaming task %s reconnect attempt %d/%d in %d ms", config_.taskId.c_str(),
+               attempt, config_.reconnectAttempts, delayMs);
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_until(lock,
+                           std::min(taskDeadline_, std::chrono::steady_clock::now() +
+                                                       std::chrono::milliseconds(delayMs)),
+                           [this] { return stopping_.load() || failed_.load(); });
+        }
+        if (stopping_ || failed_ || durationReached()) break;
+        if (openSession()) {
+            reconnecting_ = false;
+            AG_LOG(INFO, "Streaming task %s reconnected on attempt %d", config_.taskId.c_str(),
+                   attempt);
+            return true;
+        }
+        output_.close();
+        releaseCodecs();
+        if (!outputFailed_) break;
+        delayMs = std::min(delayMs * 2, 10000);
+    }
+    reconnecting_ = false;
+    if (!stopping_ && !durationReached() && !failed_) {
+        failureMessage_ = outputFailed_
+                              ? "Streaming destination reconnect exhausted after " +
+                                    std::to_string(config_.reconnectAttempts) + " attempts"
+                              : "Streaming media encoder restart failed";
+        failed_ = true;
+    }
+    return false;
 }
 
 void StreamingSink::stop() {
@@ -172,7 +239,9 @@ bool StreamingSink::encodeAudio(const AudioFrame& pcm) {
         }
     }
     return MediaEncoder::encode(audio_, frame.get(), [this](AVPacket* packet) {
-        return output_.write(packet, false, audio_->time_base);
+        bool written = output_.write(packet, false, audio_->time_base);
+        if (!written) outputFailed_ = true;
+        return written;
     });
 }
 
@@ -181,9 +250,8 @@ void StreamingSink::run() {
         std::lock_guard<std::mutex> lock(mutex_);
         workerId_ = std::this_thread::get_id();
     }
-    const auto start = std::chrono::steady_clock::now();
-    bool durationReached = false;
     while (!stopping_ && !failed_) {
+        if (durationReached()) break;
         FramePtr frame;
         {
             std::unique_lock<std::mutex> lock(mutex_);
@@ -192,6 +260,7 @@ void StreamingSink::run() {
             frame = std::move(pendingVideo_);
         }
         if (stopping_ || failed_) break;
+        bool mediaOk = true;
         if (frame) {
             uint64_t timestamp = frame->pts;
             if (!hasOrigin_) {
@@ -206,20 +275,23 @@ void StreamingSink::run() {
             int64_t increment = av_rescale_q(1, {1, 1000}, video_->time_base);
             frame->pts = std::max<int64_t>(lastVideoPts_ < 0 ? 0 : lastVideoPts_ + increment, pts);
             lastVideoPts_ = frame->pts;
-            if (!MediaEncoder::encode(video_, frame.get(), [this](AVPacket* packet) {
-                    return output_.write(packet, true, video_->time_base);
-                }))
-                failed_ = !stopping_.load();
+            mediaOk = MediaEncoder::encode(video_, frame.get(), [this](AVPacket* packet) {
+                bool written = output_.write(packet, true, video_->time_base);
+                if (!written) outputFailed_ = true;
+                return written;
+            });
         }
-        if (!failed_ && !stopping_ &&
-            !mixer_.drain(audio_->frame_size, false, [this](const AudioFrame& pcm) {
+        if (mediaOk && !failed_ && !stopping_)
+            mediaOk = mixer_.drain(audio_->frame_size, false, [this](const AudioFrame& pcm) {
                 return !stopping_.load() && encodeAudio(pcm);
-            }))
-            failed_ = !stopping_.load();
-        if (std::chrono::steady_clock::now() - start >=
-            std::chrono::seconds(config_.maxDurationSeconds)) {
-            durationReached = true;
-            break;
+            });
+        if (!mediaOk && !stopping_ && !durationReached()) {
+            // Recover after AudioMixer::drain unwinds, before replacing codecs or clearing PCM.
+            if (outputFailed_) {
+                if (!reconnect()) break;
+            } else {
+                failed_ = true;
+            }
         }
     }
     output_.close();
@@ -230,10 +302,9 @@ void StreamingSink::run() {
         std::lock_guard<std::mutex> lock(mutex_);
         callback = callback_;
     }
-    if (!stopping_ && callback && (failed_ || durationReached)) {
+    if (!stopping_ && callback && (failed_ || durationReached())) {
         callback(config_.taskId, failed_ ? "failed" : "success",
-                 failed_ ? "Streaming destination failed or disconnected"
-                         : "Streaming duration reached");
+                 failed_ ? failureMessage_ : "Streaming duration reached");
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);

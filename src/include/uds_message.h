@@ -24,6 +24,8 @@ struct UDSMessage {
     std::string output_url;
     std::string output_token;
     int output_timeout_ms = 5000;
+    int output_reconnect_attempts = 5;
+    int output_reconnect_delay_ms = 1000;
 };
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager
@@ -52,6 +54,8 @@ inline void to_json(nlohmann::json& j, const UDSMessage& m) {
     j["output_url"] = m.output_url;
     j["output_token"] = m.output_token;
     j["output_timeout_ms"] = m.output_timeout_ms;
+    j["output_reconnect_attempts"] = m.output_reconnect_attempts;
+    j["output_reconnect_delay_ms"] = m.output_reconnect_delay_ms;
     for (const auto& region : m.regions)
         j["regions"].push_back({{"uid", region.uid},
                                 {"x", region.x},
@@ -86,6 +90,10 @@ inline void from_json(const nlohmann::json& j, UDSMessage& m) {
     if (j.contains("output_url")) j.at("output_url").get_to(m.output_url);
     if (j.contains("output_token")) j.at("output_token").get_to(m.output_token);
     if (j.contains("output_timeout_ms")) j.at("output_timeout_ms").get_to(m.output_timeout_ms);
+    if (j.contains("output_reconnect_attempts"))
+        j.at("output_reconnect_attempts").get_to(m.output_reconnect_attempts);
+    if (j.contains("output_reconnect_delay_ms"))
+        j.at("output_reconnect_delay_ms").get_to(m.output_reconnect_delay_ms);
     m.regions.clear();
     if (j.contains("regions")) {
         for (const auto& value : j.at("regions")) {

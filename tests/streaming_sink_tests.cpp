@@ -8,9 +8,84 @@
 #include <thread>
 
 #include "streaming_sink.h"
+#include "uds_message.h"
 
 using agora::rtc::StreamingOutput;
 using agora::rtc::StreamingSink;
+
+TEST(StreamingSinkTest, RejectsInvalidReconnectPolicy) {
+    for (int attempts : {-1, 21}) {
+        StreamingSink sink;
+        StreamingSink::Config config;
+        config.output.url = "rtmp://127.0.0.1:1/live/test";
+        config.reconnectAttempts = attempts;
+        EXPECT_FALSE(sink.initialize(config));
+    }
+    for (int delay : {99, 10001}) {
+        StreamingSink sink;
+        StreamingSink::Config config;
+        config.output.url = "rtmp://127.0.0.1:1/live/test";
+        config.reconnectDelayMs = delay;
+        EXPECT_FALSE(sink.initialize(config));
+    }
+}
+
+TEST(StreamingSinkTest, ReconnectDefaultsAndExplicitZeroSurviveUds) {
+    auto defaults = nlohmann::json{{"cmd", "rtmp"}, {"channel", "test"}, {"access_token", ""}}
+                        .get<UDSMessage>();
+    EXPECT_EQ(defaults.output_reconnect_attempts, 5);
+    EXPECT_EQ(defaults.output_reconnect_delay_ms, 1000);
+    defaults.output_reconnect_attempts = 0;
+    defaults.output_reconnect_delay_ms = 100;
+    auto disabled = nlohmann::json(defaults).get<UDSMessage>();
+    EXPECT_EQ(disabled.output_reconnect_attempts, 0);
+    EXPECT_EQ(disabled.output_reconnect_delay_ms, 100);
+}
+
+TEST(StreamingSinkTest, StopInterruptsStalledInitialHandshake) {
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(server, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    ASSERT_EQ(listen(server, 1), 0);
+    socklen_t size = sizeof(address);
+    ASSERT_EQ(getsockname(server, reinterpret_cast<sockaddr*>(&address), &size), 0);
+    std::promise<void> accepted;
+    auto ready = accepted.get_future();
+    auto peer = std::async(std::launch::async, [&] {
+        int client = accept(server, nullptr, nullptr);
+        accepted.set_value();
+        if (client >= 0) {
+            char data[4096];
+            while (recv(client, data, sizeof(data), 0) > 0) {
+            }
+            close(client);
+        }
+        close(server);
+    });
+    StreamingSink sink;
+    StreamingSink::Config config;
+    config.width = 320;
+    config.height = 180;
+    config.output.url =
+        "rtmp://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/live/test";
+    config.output.timeoutMs = 30000;
+    ASSERT_TRUE(sink.initialize(config));
+    auto starting = std::async(std::launch::async, [&] { return sink.start(); });
+    if (ready.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+        shutdown(server, SHUT_RDWR);
+        sink.stop();
+        FAIL() << "Publisher did not enter the handshake";
+    }
+    auto stopped = std::chrono::steady_clock::now();
+    sink.stop();
+    EXPECT_FALSE(starting.get());
+    EXPECT_FALSE(sink.hasFailed());
+    EXPECT_LT(std::chrono::steady_clock::now() - stopped, std::chrono::seconds(2));
+    peer.get();
+}
 
 TEST(StreamingSinkTest, RejectsFileDestination) {
     StreamingSink sink;

@@ -564,6 +564,8 @@ void TaskPipe::handleStreamingCommand(const std::string& action, const UDSMessag
         config.output.url = msg.output_url;
         config.output.token = msg.output_token;
         config.output.timeoutMs = msg.output_timeout_ms;
+        config.reconnectAttempts = msg.output_reconnect_attempts;
+        config.reconnectDelayMs = msg.output_reconnect_delay_ms;
         config.targetUsers = msg.uid;
         config.layout = msg.layout;
         config.regions = msg.regions;

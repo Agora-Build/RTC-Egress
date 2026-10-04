@@ -34,7 +34,9 @@ Create a task using the existing endpoint:
     "users": ["1001", "1002"],
     "layout": "spotlight",
     "output_url": "rtmp://receiver.example/live/stream-key",
-    "output_timeout_ms": 5000
+    "output_timeout_ms": 5000,
+    "output_reconnect_attempts": 5,
+    "output_reconnect_delay_ms": 1000
   }
 }
 ```
@@ -49,14 +51,44 @@ The output canvas defaults to 1280x720; optional even `width` and `height` and c
 `regions` follow the native layout contract. Explicit user order selects the
 spotlight speaker. Passthrough requests fall back to FFmpeg decoding for publishing.
 
-Task stop uses the existing `/tasks/{task_id}/stop` endpoint. Startup failures and
-failed packet writes produce failed tasks; explicit successful stop produces STOPPED.
+Task stop uses the existing `/tasks/{task_id}/stop` endpoint. Initial connection
+failures produce failed tasks immediately; explicit successful stop produces STOPPED.
 WHIP session teardown gets a bounded one-second deadline. StreamingSink creates no
 recording file or recording metadata; tests record at the receiving service.
 
-The transport backend currently provides no automatic reconnect. WHIP failure
-detection follows the FFmpeg muxer's ICE/DTLS and socket errors; an unresponsive UDP
-peer may not immediately cause an error. Deployments should monitor receiver health.
+## Automatic Reconnect
+
+An established stream reconnects when FFmpeg reports a destination write failure.
+The task and its Agora connection remain active during recovery. Retry settings
+are validated by the HTTP API and native worker:
+
+| Payload field | Default | Accepted values |
+| --- | --- | --- |
+| `output_reconnect_attempts` | 5 | 0 through 20; zero disables reconnect |
+| `output_reconnect_delay_ms` | 1000 | 100 through 10000 milliseconds |
+
+The delay doubles after each failed connection attempt and stops increasing at
+10 seconds. Defaults produce delays of 1, 2, 4, 8, and 10 seconds, in addition to
+the bounded connection time and session teardown. The retry budget resets after
+a successful connection. Exhaustion completes the task as failed with the attempt
+count; media processing/encoder failures also remain terminal.
+
+Every reconnect opens fresh H264 and AAC/Opus encoders and a new transport session,
+with new codec headers, a first video keyframe, and timestamps starting from the
+current RTC media. Input queues stay bounded; only the latest composed video is
+retained and buffered outage audio is discarded when the connection opens. Media
+lost during the outage is not replayed. WHIP creates a new session and attempts a
+bounded DELETE for the previous session.
+
+Stop interrupts retry delays and connection/write operations. A shared stop flag
+remains effective across transport resets; cleanup can still use its one-second
+teardown window. Downtime counts toward the task's maximum duration, and that
+deadline also limits reconnect handshakes. A duration limit completes successfully.
+
+WHIP failure detection follows the FFmpeg muxer's ICE/DTLS and socket errors;
+an unresponsive UDP peer may not immediately cause an error. This reconnect policy
+does not add a receiver heartbeat or detect a silent UDP blackhole. Deployments
+should monitor receiver health.
 
 ## Build And Verification
 
@@ -76,11 +108,22 @@ cmake --build build/tests-whip -j 4
 ctest --test-dir build/tests-whip --output-on-failure
 python3 scripts/rtc-egress-streaming-e2e.py --receiver /path/to/mediamtx
 python3 scripts/rtc-egress-live-e2e.py --receiver /path/to/mediamtx --stream-sdk-dir /path/to/publisher/sdk
+python3 scripts/rtc-egress-live-e2e.py --filter rtmp,whip --restart-receiver --receiver /path/to/mediamtx --stream-sdk-dir /path/to/publisher/sdk
 ```
 
-The standalone receiver tests verify one/two-user media decoding, codecs, both
-video colors and audio tones, audio arriving before video, WHIP session deletion,
-and RTMP disconnection. Live
-tests exercise API requests, Redis routing, Agora publishers, native workers,
-layout geometry, stop/status behavior, and receiver recordings. Use `atem serv
-files` to review the generated artifacts.
+The standalone receiver tests cover 20 cases: normal one/two-user output, receiver
+restart with one/two users, retry exhaustion, disabled retries, stop during backoff
+or a stalled handshake, and duration expiration during backoff or a stalled
+handshake, for both protocols. Recovery recordings must fully decode, preserve
+both video colors/audio tones, have an early decodable keyframe, and have fresh
+synchronized timestamps. MediaMTX may discard the first video keyframe when its
+fMP4 segment starts from a slightly later audio timestamp; the receiver check
+allows the next keyframe within 1.5 seconds while still requiring full decoding.
+Tests also check WHIP session deletion and completion callbacks.
+Use `--filter restart` (or other comma-separated substrings) to select cases.
+
+Live tests exercise API requests, Redis routing, Agora publishers, native workers,
+layout geometry, stop/status behavior, and receiver recordings. With
+`--restart-receiver`, each streaming case verifies that its original task remains
+active during the outage, publishes a new receiver recording, and then stops
+through the API. Use `atem serv files` to review the generated artifacts.
