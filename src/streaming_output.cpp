@@ -1,6 +1,7 @@
 #define AG_LOG_TAG "StreamingOutput"
 #include "streaming_output.h"
 
+#include <algorithm>
 #include <cctype>
 
 #include "common/log.h"
@@ -36,21 +37,29 @@ bool StreamingOutput::validate(const Config& config) {
 }
 
 void StreamingOutput::setDeadline(int timeoutMs) {
-    deadlineUs_ = av_gettime_relative() + static_cast<int64_t>(timeoutMs) * 1000;
+    int64_t deadline = av_gettime_relative() + static_cast<int64_t>(timeoutMs) * 1000;
+    if (!closing_ && taskDeadlineUs_) deadline = std::min(deadline, taskDeadlineUs_);
+    deadlineUs_ = deadline;
 }
 
 int StreamingOutput::interrupt(void* opaque) {
     auto* output = static_cast<StreamingOutput*>(opaque);
-    return output->cancelled_.load() || av_gettime_relative() >= output->deadlineUs_.load();
+    return (!output->closing_ &&
+            (output->cancelled_.load() || (output->stopping_ && output->stopping_->load()))) ||
+           av_gettime_relative() >= output->deadlineUs_.load();
 }
 
 bool StreamingOutput::open(const Config& config, const AVCodecContext* video,
-                           const AVCodecContext* audio) {
+                           const AVCodecContext* audio, const std::atomic<bool>* stopping,
+                           int64_t taskDeadlineUs) {
     close();
     if (!validate(config) || !video || !audio) return false;
     config_ = config;
+    stopping_ = stopping;
+    taskDeadlineUs_ = taskDeadlineUs;
     cancelled_ = false;
     setDeadline(config_.timeoutMs);
+    if (interrupt(this)) return false;
     const char* muxer = config.protocol == Protocol::RTMP ? "flv" : "whip";
     if (avformat_alloc_output_context2(&context_, nullptr, muxer, config.url.c_str()) < 0)
         return false;
@@ -96,7 +105,7 @@ bool StreamingOutput::open(const Config& config, const AVCodecContext* video,
 }
 
 bool StreamingOutput::write(AVPacket* packet, bool video, AVRational timeBase) {
-    if (!headerWritten_ || cancelled_) return false;
+    if (!headerWritten_ || cancelled_ || (stopping_ && stopping_->load())) return false;
     auto* stream = video ? video_ : audio_;
     av_packet_rescale_ts(packet, timeBase, stream->time_base);
     packet->stream_index = stream->index;
@@ -111,7 +120,7 @@ void StreamingOutput::cancel() {
 void StreamingOutput::close() {
     if (!context_) return;
     // Allow a bounded final transport teardown, including WHIP's session DELETE.
-    cancelled_ = false;
+    closing_ = true;
     setDeadline(1000);
     if (headerWritten_) av_write_trailer(context_);
     if (context_->pb && !(context_->oformat->flags & AVFMT_NOFILE)) avio_closep(&context_->pb);
@@ -119,6 +128,7 @@ void StreamingOutput::close() {
     context_ = nullptr;
     video_ = audio_ = nullptr;
     headerWritten_ = false;
+    closing_ = false;
 }
 
 }  // namespace agora::rtc

@@ -48,12 +48,15 @@ parser.add_argument('--stream-tool', type=Path, default=Path(shutil.which('strea
 parser.add_argument('--stream-sdk-dir', type=Path, help='SDK library directory matching the publisher binary')
 parser.add_argument('--verify-run', type=Path, help='Recheck saved recordings without starting services or publishers')
 parser.add_argument('--receiver', type=Path, help='MediaMTX binary to enable real RTMP/WHIP receiver cases')
+parser.add_argument('--restart-receiver', action='store_true', help='Restart the streaming receiver during every RTMP/WHIP case')
 parser.add_argument('--repeat', type=int, default=1, help='Repeat each selected case to check connection lifecycle')
 args = parser.parse_args()
 if args.seconds < 10:
     parser.error('--seconds must be at least 10 for meaningful audio/video verification')
 if args.repeat < 1 or args.repeat > 10:
     parser.error('--repeat must be between 1 and 10')
+if args.restart_receiver and not args.receiver:
+    parser.error('--restart-receiver requires --receiver')
 STREAM = args.stream_tool.resolve()
 receiver_spec = importlib.util.spec_from_file_location('streaming_e2e', PROJECT / 'scripts/rtc-egress-streaming-e2e.py')
 streaming_e2e = importlib.util.module_from_spec(receiver_spec)
@@ -75,6 +78,7 @@ SECRETS = []
 PROCESSES = []
 RESULTS = []
 REDIS_OWNED = False
+RECEIVER = None
 CHANNEL = 'egress_e2e_' + str(int(time.time()))
 ENV = os.environ.copy()
 for key in ['CONFIG_FILE', 'CONFIG_DIR', 'REDIS_ADDR', 'REDIS_DB', 'REDIS_PASSWORD',
@@ -187,6 +191,24 @@ def wait_ready(process):
             return
         time.sleep(0.25)
     raise RuntimeError('Publisher did not connect: ' + str(process.log_path))
+
+
+def start_receiver():
+    global RECEIVER
+    RECEIVER = start([str(args.receiver.resolve()), str(ROOT / 'receiver.json')],
+                     ROOT / 'logs' / ('receiver_' + str(time.time_ns()) + '.log'))
+    wait_health('http://127.0.0.1:18297/v3/webrtcsessions/list', RECEIVER)
+
+
+def wait_worker_log(process, text, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if text in process.log_path.read_text():
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise RuntimeError('Worker did not report ' + text + ': ' + str(process.log_path))
 
 
 def token(uid):
@@ -396,6 +418,37 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
             raise RuntimeError('Recording task was not enqueued: ' + str(response))
         result['task_id'] = task_id
         write_json(case / 'start_response.json', response)
+        if output != 'record' and args.restart_receiver:
+            # Wait for the receiver to have media before interrupting the outgoing destination.
+            deadline = time.monotonic() + 15
+            while True:
+                paths = request('http://127.0.0.1:18297/v3/paths/list')['items']
+                if any(item['name'] == name and item.get('ready') for item in paths):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Streaming destination never became ready')
+                time.sleep(0.1)
+            time.sleep(3)
+            worker_pids = [pid for pid in descendants(process.pid)
+                           if Path('/proc', str(pid), 'comm').read_text().strip() == 'eg_worker']
+            if len(worker_pids) != 1:
+                raise RuntimeError('Expected exactly one native worker before receiver restart')
+            stop(RECEIVER)
+            wait_worker_log(process, 'reconnect attempt ')
+            during = request(API_URL + '/tasks/' + task_id + '/status',
+                             {'request_id': 'outage' + str(time.time_ns())})
+            write_json(case / 'outage_status.json', during)
+            if during.get('state') != 'PROCESSING':
+                raise RuntimeError('Task did not remain active during outage: ' + str(during))
+            time.sleep(1.2)
+            start_receiver()
+            wait_worker_log(process, 'reconnected on attempt ')
+            if worker_pids != [pid for pid in descendants(process.pid)
+                               if Path('/proc', str(pid), 'comm').read_text().strip() == 'eg_worker']:
+                raise RuntimeError('Native worker changed during receiver restart')
+            # Capture a full verification window after reconnection.
+            result['receiver_restarted'] = True
+            result['worker_pids'] = worker_pids
         time.sleep(args.seconds)
         stopped = request(API_URL + '/tasks/' + task_id + '/stop', {'request_id': 'stop' + str(time.time_ns())})
         write_json(case / 'stop_response.json', stopped)
@@ -416,14 +469,15 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
         for publisher in publishers:
             if publisher.poll() is not None:
                 raise RuntimeError('Publisher stopped during recording')
-        files = list((case / 'recordings').glob('*.mp4')) if output == 'record' else list((ROOT / 'received' / name).glob('*.mp4'))
-        if len(files) != 1:
-            raise RuntimeError('Expected one fresh MP4 output, found ' + str(len(files)))
-        result['recording'] = str(files[0].relative_to(ROOT))
-        metrics = check_recording(files[0], case, len(publishers) > 1, layout, users, output)
+        files = sorted((case / 'recordings').glob('*.mp4')) if output == 'record' else sorted((ROOT / 'received' / name).glob('*.mp4'))
+        expected_files = 2 if result.get('receiver_restarted') else 1
+        if len(files) != expected_files:
+            raise RuntimeError('Expected ' + str(expected_files) + ' MP4 outputs, found ' + str(len(files)))
+        result['recording'] = str(files[-1].relative_to(ROOT))
+        metrics = check_recording(files[-1], case, len(publishers) > 1, layout, users, output)
         if output == 'whip' and streaming_e2e.sessions():
             raise RuntimeError('WHIP receiver session remained after task stop')
-        result.update({'status': 'PASS', 'recording': str(files[0].relative_to(ROOT)), 'metrics': metrics})
+        result.update({'status': 'PASS', 'recording': str(files[-1].relative_to(ROOT)), 'metrics': metrics})
         log('PASS ' + name + ': video=' + str(metrics['video_duration']) + 's audio=' + str(metrics['audio_duration']) +
             's, tones=' + str(metrics['audio_tone_amplitudes']))
     except Exception as error:
@@ -484,16 +538,7 @@ def main():
     if args.receiver:
         receiver_config = ROOT / 'receiver.json'
         write_json(receiver_config, streaming_e2e.receiver_config(ROOT))
-        receiver = start([str(args.receiver.resolve()), str(receiver_config)], ROOT / 'logs/receiver.log')
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                streaming_e2e.sessions()
-                break
-            except Exception:
-                if receiver.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError('Streaming receiver did not become ready')
-                time.sleep(0.1)
+        start_receiver()
     publisher_1 = start([str(STREAM), '--app-id', APP_ID, '--channel', CHANNEL, '--rtc-user-id', '1001',
                          '--token', token(1001), '--mode', 'encoded', str(source_1)], ROOT / 'logs/publisher_1001.log', env=STREAM_ENV)
     wait_ready(publisher_1)
@@ -554,14 +599,15 @@ def verify_saved_run():
             if terminal.get('state') != 'STOPPED':
                 raise RuntimeError('Recording did not stop successfully: ' + str(terminal))
             output = result.get('output', 'record')
-            files = list((case / 'recordings').glob('*.mp4')) if output == 'record' else list((ROOT / 'received' / result['case']).glob('*.mp4'))
-            if len(files) != 1:
-                raise RuntimeError('Expected one fresh MP4 output, found ' + str(len(files)))
-            result['recording'] = str(files[0].relative_to(ROOT))
-            result['metrics'] = check_recording(files[0], case, result['publisher_count'] > 1,
+            files = sorted((case / 'recordings').glob('*.mp4')) if output == 'record' else sorted((ROOT / 'received' / result['case']).glob('*.mp4'))
+            expected_files = 2 if result.get('receiver_restarted') else 1
+            if len(files) != expected_files:
+                raise RuntimeError('Expected ' + str(expected_files) + ' MP4 outputs, found ' + str(len(files)))
+            result['recording'] = str(files[-1].relative_to(ROOT))
+            result['metrics'] = check_recording(files[-1], case, result['publisher_count'] > 1,
                                                 result['layout'], result['users'], output)
             result['status'] = 'PASS'
-            result['recording'] = str(files[0].relative_to(ROOT))
+            result['recording'] = str(files[-1].relative_to(ROOT))
             log('PASS ' + result['case'])
         except Exception as error:
             result['error'] = clean(str(error))

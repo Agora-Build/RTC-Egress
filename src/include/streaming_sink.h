@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -25,6 +26,8 @@ class StreamingSink {
         int videoBitrate = 2000000;
         int audioBitrate = 128000;
         int maxDurationSeconds = 28800;
+        int reconnectAttempts = 5;
+        int reconnectDelayMs = 1000;
         std::string taskId;
         std::vector<std::string> targetUsers;
         std::string layout = "flat";
@@ -43,6 +46,9 @@ class StreamingSink {
     bool hasFailed() const {
         return failed_.load();
     }
+    bool isReconnecting() const {
+        return reconnecting_.load();
+    }
     void setCompletionCallback(CompletionCallback callback);
     void onVideoFrame(const uint8_t* y, const uint8_t* u, const uint8_t* v, int32_t ys, int32_t us,
                       int32_t vs, uint32_t width, uint32_t height, uint64_t timestamp,
@@ -59,6 +65,9 @@ class StreamingSink {
     using FramePtr = std::unique_ptr<AVFrame, FrameDeleter>;
     bool selected(const std::string& userId) const;
     bool encodeAudio(const AudioFrame& frame);
+    bool openSession();
+    bool reconnect();
+    bool durationReached() const;
     void run();
     void releaseCodecs();
     Config config_;
@@ -77,7 +86,12 @@ class StreamingSink {
     std::atomic<bool> active_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> failed_{false};
+    std::atomic<bool> reconnecting_{false};
     bool initialized_ = false;
+    bool outputFailed_ = false;  // Publishing thread only.
+    int64_t taskDeadlineUs_ = 0;
+    std::chrono::steady_clock::time_point taskDeadline_;
+    std::string failureMessage_;
     uint64_t originMs_ = 0;
     bool hasOrigin_ = false;
     int64_t lastVideoPts_ = -1;

@@ -11,23 +11,25 @@ import (
 // UDSMessage defines the communication protocol between Go (egress) and C++ (eg_worker).
 // All fields are serialized in JSON format.
 type UDSMessage struct {
-	TaskID             string         `json:"task_id"`            // Task ID for tracking completion
-	Cmd                string         `json:"cmd"`                // "snapshot", "record", "rtmp", or "whip"
-	Action             string         `json:"action"`             // "start", "stop", "status"
-	Layout             string         `json:"layout"`             // "flat", "spotlight", "customized", or "freestyle"
-	FreestyleCanvasUrl string         `json:"freestyleCanvasUrl"` // URL for custom canvas, used if layout is "freestyle"
-	Uid                []string       `json:"uid"`                // User IDs, if empty, all users will be included
-	Channel            string         `json:"channel"`            // Channel Name
-	AccessToken        string         `json:"access_token"`       // Access token for authentication
-	WorkerUid          int            `json:"workerUid"`          // Worker UID
-	IntervalInMs       int            `json:"interval_in_ms"`     // Interval in milliseconds
-	VideoDecodeMode    int            `json:"videoDecodeMode"`    // -1=auto(default), 0=passthrough, 1=ffmpeg, 2=sdk
-	Regions            []LayoutRegion `json:"regions,omitempty"`
-	Width              int            `json:"width,omitempty"`
-	Height             int            `json:"height,omitempty"`
-	OutputURL          string         `json:"output_url,omitempty"`
-	OutputToken        string         `json:"output_token,omitempty"`
-	OutputTimeoutMs    int            `json:"output_timeout_ms,omitempty"`
+	TaskID                  string         `json:"task_id"`            // Task ID for tracking completion
+	Cmd                     string         `json:"cmd"`                // "snapshot", "record", "rtmp", or "whip"
+	Action                  string         `json:"action"`             // "start", "stop", "status"
+	Layout                  string         `json:"layout"`             // "flat", "spotlight", "customized", or "freestyle"
+	FreestyleCanvasUrl      string         `json:"freestyleCanvasUrl"` // URL for custom canvas, used if layout is "freestyle"
+	Uid                     []string       `json:"uid"`                // User IDs, if empty, all users will be included
+	Channel                 string         `json:"channel"`            // Channel Name
+	AccessToken             string         `json:"access_token"`       // Access token for authentication
+	WorkerUid               int            `json:"workerUid"`          // Worker UID
+	IntervalInMs            int            `json:"interval_in_ms"`     // Interval in milliseconds
+	VideoDecodeMode         int            `json:"videoDecodeMode"`    // -1=auto(default), 0=passthrough, 1=ffmpeg, 2=sdk
+	Regions                 []LayoutRegion `json:"regions,omitempty"`
+	Width                   int            `json:"width,omitempty"`
+	Height                  int            `json:"height,omitempty"`
+	OutputURL               string         `json:"output_url,omitempty"`
+	OutputToken             string         `json:"output_token,omitempty"`
+	OutputTimeoutMs         int            `json:"output_timeout_ms,omitempty"`
+	OutputReconnectAttempts int            `json:"output_reconnect_attempts"`
+	OutputReconnectDelayMs  int            `json:"output_reconnect_delay_ms"`
 }
 
 // UDSCompletionMessage defines the completion response from C++ worker to Go manager
@@ -165,10 +167,12 @@ func buildUDSMessageFromQueueTask(task *queue.Task) (*UDSMessage, error) {
 	if layoutErr != nil {
 		return nil, layoutErr
 	}
-	udsMsg.OutputURL, udsMsg.OutputToken, udsMsg.OutputTimeoutMs, layoutErr = readStreamOutput(payload)
-	if layoutErr != nil {
-		return nil, layoutErr
+	stream, streamErr := readStreamOutput(payload)
+	if streamErr != nil {
+		return nil, streamErr
 	}
+	udsMsg.OutputURL, udsMsg.OutputToken, udsMsg.OutputTimeoutMs = stream.destination, stream.token, stream.timeout
+	udsMsg.OutputReconnectAttempts, udsMsg.OutputReconnectDelayMs = stream.attempts, stream.delay
 
 	// TaskID override for stop/status payloads
 	if taskIDVal, ok := payload["task_id"]; ok {
@@ -225,7 +229,11 @@ func ValidateUDSMessage(msg *UDSMessage) error {
 
 	// Validate required fields based on action
 	if msg.Action == "start" {
-		if err := validateStreamOutput(msg.Cmd, msg.Layout, msg.OutputURL, msg.OutputToken, msg.OutputTimeoutMs); err != nil {
+		stream := streamOutputSettings{
+			destination: msg.OutputURL, token: msg.OutputToken, timeout: msg.OutputTimeoutMs,
+			attempts: msg.OutputReconnectAttempts, delay: msg.OutputReconnectDelayMs,
+		}
+		if err := validateStreamOutput(msg.Cmd, msg.Layout, stream); err != nil {
 			return err
 		}
 		if err := validateNativeLayout(msg.Layout, msg.Regions, msg.Width, msg.Height); err != nil {
@@ -260,11 +268,11 @@ func ValidateStartTaskRequest(taskReq *TaskRequest) error {
 		return err
 	}
 	if taskReq.Action == "start" {
-		destination, token, timeout, err := readStreamOutput(taskReq.Payload)
+		stream, err := readStreamOutput(taskReq.Payload)
 		if err != nil {
 			return err
 		}
-		if err := validateStreamOutput(taskReq.Cmd, taskReq.Payload["layout"].(string), destination, token, timeout); err != nil {
+		if err := validateStreamOutput(taskReq.Cmd, taskReq.Payload["layout"].(string), stream); err != nil {
 			return err
 		}
 	}

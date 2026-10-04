@@ -1,6 +1,11 @@
 package egress
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/AgoraIO/RTC-Egress/pkg/queue"
+)
 
 func streamPayload(cmd string) map[string]interface{} {
 	payload := map[string]interface{}{
@@ -14,6 +19,59 @@ func streamPayload(cmd string) map[string]interface{} {
 		payload["output_token"] = "fixture-token"
 	}
 	return payload
+}
+
+func TestStreamReconnectValidation(t *testing.T) {
+	for _, cmd := range []string{"rtmp", "whip"} {
+		for _, scenario := range []struct {
+			field string
+			value interface{}
+		}{
+			{"output_reconnect_attempts", -1}, {"output_reconnect_attempts", 21},
+			{"output_reconnect_attempts", 1.5}, {"output_reconnect_attempts", "5"},
+			{"output_reconnect_attempts", nil},
+			{"output_reconnect_delay_ms", 99}, {"output_reconnect_delay_ms", 10001},
+			{"output_reconnect_delay_ms", nil},
+		} {
+			payload := streamPayload(cmd)
+			payload[scenario.field] = scenario.value
+			if err := ValidateStartTaskRequest(&TaskRequest{RequestID: "retrytest", Cmd: cmd, Action: "start", Payload: payload}); err == nil {
+				t.Errorf("%s accepted %s=%v", cmd, scenario.field, scenario.value)
+			}
+		}
+	}
+}
+
+func TestStreamReconnectSettingsReachWorker(t *testing.T) {
+	for _, attempts := range []int{0, 5, 20} {
+		payload := streamPayload("rtmp")
+		if attempts != 5 {
+			payload["output_reconnect_attempts"] = attempts
+			payload["output_reconnect_delay_ms"] = 100
+		}
+		msg, err := buildUDSMessageFromQueueTask(&queue.Task{ID: "retrytest", Cmd: "rtmp", Action: "start", Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]interface{}
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if fields["output_reconnect_attempts"] != float64(attempts) {
+			t.Fatalf("retry setting lost in worker payload: %s", encoded)
+		}
+		wantDelay := float64(100)
+		if attempts == 5 {
+			wantDelay = 1000
+		}
+		if fields["output_reconnect_delay_ms"] != wantDelay {
+			t.Fatalf("retry delay lost in worker payload: %s", encoded)
+		}
+	}
 }
 
 func TestStreamDestinationValidation(t *testing.T) {

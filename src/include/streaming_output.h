@@ -23,7 +23,9 @@ class StreamingOutput {
 
     ~StreamingOutput();
     static bool validate(const Config& config);
-    bool open(const Config& config, const AVCodecContext* video, const AVCodecContext* audio);
+    // The optional stop flag must outlive the session; deadlines use av_gettime_relative().
+    bool open(const Config& config, const AVCodecContext* video, const AVCodecContext* audio,
+              const std::atomic<bool>* stopping = nullptr, int64_t taskDeadlineUs = 0);
     bool write(AVPacket* packet, bool video, AVRational timeBase);
     void cancel();
     void close();
@@ -38,6 +40,9 @@ class StreamingOutput {
     bool headerWritten_ = false;
     std::atomic<bool> cancelled_{false};
     std::atomic<int64_t> deadlineUs_{0};
+    const std::atomic<bool>* stopping_ = nullptr;
+    int64_t taskDeadlineUs_ = 0;
+    bool closing_ = false;
 };
 
 }  // namespace agora::rtc
