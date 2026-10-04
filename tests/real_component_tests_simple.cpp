@@ -609,9 +609,11 @@ TEST_F(SimpleRealComponentTest, ConcurrentOperations) {
 TEST_F(SimpleRealComponentTest, ErrorHandling) {
     using namespace agora::rtc;
 
-    // Test invalid directory
+    // A regular file in the parent path fails even when tests run as root in Docker.
+    const std::string blockedParent = testDir_ + "/blocked";
+    std::ofstream(blockedParent) << "not a directory";
     TestableRecordingSink::Config invalidConfig;
-    invalidConfig.outputDir = "/invalid/nonexistent/path/that/cannot/be/created";
+    invalidConfig.outputDir = blockedParent + "/recordings";
 
     TestableRecordingSink recordingSink;
     EXPECT_FALSE(recordingSink.initialize(invalidConfig));  // Should fail

@@ -967,7 +967,7 @@ func (wm *WorkerManager) getPrioritizedQueues(ctx context.Context, patterns []st
 			if len(keyParts) >= 4 {
 				// Could be: egress:region:record:channelName or egress:region:web:record:channelName
 				possibleRegion := keyParts[1]
-				if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "web" && possibleRegion != "cmd" {
+				if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "rtmp" && possibleRegion != "whip" && possibleRegion != "web" && possibleRegion != "cmd" {
 					taskRegion = possibleRegion
 					isRegionalTask = true
 				}
@@ -1039,14 +1039,14 @@ func (wm *WorkerManager) shouldYieldForRegionalTask(queueKey string) bool {
 	if len(keyParts) >= 5 && keyParts[3] == "channel" {
 		// Format: egress:region:record:channel:* or egress:region:snapshot:channel:*
 		possibleRegion := keyParts[1]
-		if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "web" && possibleRegion != "cmd" {
+		if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "rtmp" && possibleRegion != "whip" && possibleRegion != "web" && possibleRegion != "cmd" {
 			taskRegion = possibleRegion
 			isRegionalTask = true
 		}
 	} else if len(keyParts) >= 6 && keyParts[4] == "channel" {
 		// Format: egress:region:web:record:channel:* or egress:region:web:snapshot:channel:*
 		possibleRegion := keyParts[1]
-		if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "web" && possibleRegion != "cmd" {
+		if possibleRegion != "record" && possibleRegion != "snapshot" && possibleRegion != "rtmp" && possibleRegion != "whip" && possibleRegion != "web" && possibleRegion != "cmd" {
 			taskRegion = possibleRegion
 			isRegionalTask = true
 		}

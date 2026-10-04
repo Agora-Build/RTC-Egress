@@ -19,6 +19,8 @@ config/uploader_config
 config/webhook_notifier_config
 
 .cache/
+__pycache__/
+*.pyc
 
 agora_sdk/*
 

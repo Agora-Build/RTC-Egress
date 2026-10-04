@@ -87,6 +87,20 @@ func TestIsValidQueueKey_Empty(t *testing.T) {
 
 // --- isWebTask ---
 
+func TestStreamingQueueRegionalYield(t *testing.T) {
+	manager := &WorkerManager{mode: ModeNative}
+	for _, cmd := range []string{"rtmp", "whip"} {
+		for _, channel := range []string{"demo", "channel:demo"} {
+			if manager.shouldYieldForRegionalTask("egress:" + cmd + ":" + channel) {
+				t.Fatalf("global %s queue must not yield", cmd)
+			}
+		}
+		if !manager.shouldYieldForRegionalTask("egress:eu:" + cmd + ":channel:demo") {
+			t.Fatalf("regional %s queue must yield when the consumer has no region", cmd)
+		}
+	}
+}
+
 func TestIsWebTask_BySourceQueueGlobalWeb(t *testing.T) {
 	wm := &WorkerManager{mode: ModeNative}
 	task := &queue.Task{

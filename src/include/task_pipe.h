@@ -2,6 +2,7 @@
 #include <unistd.h>  // For pipe()
 
 #include <algorithm>  // For std::max
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include "recording_sink.h"
 #include "rtc_client.h"  // Include RtcClient definition
 #include "snapshot_sink.h"
+#include "streaming_sink.h"
 #include "uds_message.h"
 
 namespace agora {
@@ -44,6 +46,7 @@ class TaskPipe {
     void handleRecordingCommand(const std::string& action, const UDSMessage& msg);
     void handleRtmpCommand(const std::string& action, const UDSMessage& msg);
     void handleWhipCommand(const std::string& action, const UDSMessage& msg);
+    void handleStreamingCommand(const std::string& action, const UDSMessage& msg);
 
     // Connection management
     bool ensureConnected(const std::string& channel, const std::string& token = "");
@@ -70,15 +73,17 @@ class TaskPipe {
 
     std::string socket_path_;
     std::string instance_id_;
-    int sockfd_ = -1;
+    std::atomic<int> sockfd_{-1};
     int shutdown_pipe_[2] = {-1, -1};  // Pipe for shutdown notification
     std::thread thread_;
-    bool running_ = false;
+    std::atomic<bool> running_{false};
+    std::mutex send_mutex_;
 
     // External dependencies
     agora::rtc::RtcClient* rtc_client_ = nullptr;
     agora::rtc::SnapshotSink* snapshot_sink_ = nullptr;
     agora::rtc::RecordingSink* recording_sink_ = nullptr;
+    agora::rtc::StreamingSink streaming_sink_;
 
     // Configurations
     agora::rtc::SnapshotSink::Config snapshot_config_;

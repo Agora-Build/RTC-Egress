@@ -118,7 +118,10 @@ bool SnapshotSink::start() {
         session.compositionMode = (config_.mode == VideoCompositor::Mode::Individual)
                                       ? MetadataManager::CompositionMode::Individual
                                       : MetadataManager::CompositionMode::Composite;
-        session.layout = MetadataManager::Layout::Flat;  // Default for snapshots
+        session.layout =
+            config_.compositorConfig.layout == "spotlight"    ? MetadataManager::Layout::Spotlight
+            : config_.compositorConfig.layout == "customized" ? MetadataManager::Layout::Customized
+                                                              : MetadataManager::Layout::Flat;
         session.width = config_.width;
         session.height = config_.height;
         session.fps = 0;  // Not applicable for snapshots

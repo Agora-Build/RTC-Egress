@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include "audio_frame.h"
+#include "audio_mixer.h"
 #include "metadata_manager.h"
 #include "ts_segment_manager.h"
 #include "video_compositor.h"
@@ -30,15 +32,6 @@ extern "C" {
 
 namespace agora {
 namespace rtc {
-
-struct AudioFrame {
-    std::vector<uint8_t> data;
-    uint64_t timestamp;
-    int sampleRate;
-    int channels;
-    bool valid = false;
-    std::string userId;
-};
 
 // Using modular VideoFrame from video_frame.h
 
@@ -80,6 +73,8 @@ class RecordingSink {
 
         // User filtering
         std::vector<std::string> targetUsers;  // Empty means record all users
+        std::string layout = "flat";
+        std::vector<LayoutRegion> regions;
 
         // TS-specific settings
         int tsSegmentDurationSeconds = 10;     // TS segment duration
@@ -175,6 +170,7 @@ class RecordingSink {
 
     // FFmpeg contexts per user (for individual mode)
     struct UserContext {
+        ~UserContext();
         AVFormatContext* formatContext = nullptr;
         AVCodecContext* videoCodecContext = nullptr;
         AVCodecContext* audioCodecContext = nullptr;
@@ -327,25 +323,7 @@ class RecordingSink {
         compositeFrameTimestamps_;  // Track when each frame was received
     std::mutex compositeBufferMutex_;
 
-    // Audio mixing for composite mode
-    struct ResamplerDeleter {
-        void operator()(SwrContext* context) const {
-            swr_free(&context);
-        }
-    };
-    struct AudioMixInput {
-        std::deque<int16_t> samples;
-        int64_t firstSample = -1;
-        int sampleRate = 0;
-        int channels = 0;
-        std::unique_ptr<SwrContext, ResamplerDeleter> resampler;
-        std::chrono::steady_clock::time_point lastArrival;
-    };
-    std::map<std::string, AudioMixInput> audioMixingBuffer_;
-    std::mutex audioMixingMutex_;
-    int64_t nextAudioMixSample_ = -1;
-    std::chrono::steady_clock::time_point audioMixStart_;
-    static constexpr int AUDIO_MIX_WAIT_MS = 40;
+    AudioMixer audioMixer_;
 
     // Performance optimizations
     std::map<std::string, SwsContext*> userScalingContexts_;  // Cached scaling contexts

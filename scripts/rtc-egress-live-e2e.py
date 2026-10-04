@@ -22,6 +22,7 @@ import argparse
 import array
 import datetime
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -46,10 +47,17 @@ parser.add_argument('--stream-tool', type=Path, default=Path(shutil.which('strea
                     help='Publisher executable (default: PATH or sibling stream-to-agora repository)')
 parser.add_argument('--stream-sdk-dir', type=Path, help='SDK library directory matching the publisher binary')
 parser.add_argument('--verify-run', type=Path, help='Recheck saved recordings without starting services or publishers')
+parser.add_argument('--receiver', type=Path, help='MediaMTX binary to enable real RTMP/WHIP receiver cases')
+parser.add_argument('--repeat', type=int, default=1, help='Repeat each selected case to check connection lifecycle')
 args = parser.parse_args()
 if args.seconds < 10:
     parser.error('--seconds must be at least 10 for meaningful audio/video verification')
+if args.repeat < 1 or args.repeat > 10:
+    parser.error('--repeat must be between 1 and 10')
 STREAM = args.stream_tool.resolve()
+receiver_spec = importlib.util.spec_from_file_location('streaming_e2e', PROJECT / 'scripts/rtc-egress-streaming-e2e.py')
+streaming_e2e = importlib.util.module_from_spec(receiver_spec)
+receiver_spec.loader.exec_module(streaming_e2e)
 if args.source_dir:
     args.source_dir = args.source_dir.resolve()
 ROOT = args.verify_run.resolve() if args.verify_run else Path('/tmp') / (
@@ -234,7 +242,7 @@ def fixture(uid, color, frequency):
     return path
 
 
-def check_recording(file, case, expect_multi):
+def check_recording(file, case, expect_multi, layout='flat', users=None, output='record'):
     (case / 'metrics.json').unlink(missing_ok=True)
     issues = []
     probe = json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(file)]))
@@ -244,9 +252,10 @@ def check_recording(file, case, expect_multi):
     if len(videos) != 1 or len(audios) != 1:
         raise RuntimeError('Expected one video and one audio stream')
     video, audio = videos[0], audios[0]
-    if video['codec_name'] != 'h264' or audio['codec_name'] != 'aac':
+    if video['codec_name'] != 'h264' or audio['codec_name'] != ('opus' if output == 'whip' else 'aac'):
         raise RuntimeError('Unexpected video/audio codecs')
-    video_duration, audio_duration = float(video['duration']), float(audio['duration'])
+    video_duration = float(video.get('duration', probe['format']['duration']))
+    audio_duration = float(audio.get('duration', probe['format']['duration']))
     if min(video_duration, audio_duration) < args.seconds - 7:
         raise RuntimeError('Recording too short: video=' + str(video_duration) + ' audio=' + str(audio_duration))
     if abs(video_duration - audio_duration) > 2.0:
@@ -281,6 +290,24 @@ def check_recording(file, case, expect_multi):
                           's: red=' + str(round(red_fraction, 4)) + ' blue=' + str(round(blue_fraction, 4)))
         if not expect_multi and blue_fraction > 0.01:
             issues.append('Unexpected second user in single-user output')
+        def color_at(x, y):
+            offset = (y * 320 + x) * 3
+            r, g, b = raw[offset:offset + 3]
+            if r > 75 and r > g * 1.4 and r > b * 1.4:
+                return 'red'
+            if b > 75 and b > g * 1.4 and b > r * 1.4:
+                return 'blue'
+            return 'black' if max(r, g, b) < 35 else 'other'
+        if layout == 'customized':
+            expected = [(120, 60, 'red'), (280, 155, 'blue' if expect_multi else 'black')]
+            if not expect_multi:
+                expected.append((20, 20, 'black'))
+            for x, y, color in expected:
+                if color_at(x, y) != color:
+                    issues.append('Customized region placement mismatch at ' + str((x, y)))
+        if layout == 'spotlight' and expect_multi and users:
+            if color_at(80, 90) != 'red' or color_at(280, 90) != 'blue' or red_fraction < blue_fraction * 2:
+                issues.append('Spotlight did not preserve the first requested speaker and edge thumbnail')
     if len({frame['sha256'] for frame in frames}) < 2:
         issues.append('Video frames do not change')
     pcm = run(['ffmpeg', '-nostdin', '-v', 'error', '-ss', str(audio_duration * 0.5), '-i', str(file),
@@ -303,15 +330,17 @@ def check_recording(file, case, expect_multi):
     if rms < 100 or tones['440'] < 50 or (expect_multi and tones['880'] < 50):
         issues.append('Publisher audio tones are missing or distorted: RMS=' +
                       str(round(rms, 2)) + ' tones=' + str(tones))
-    metadata_paths = list((case / 'recordings').glob('*.json'))
-    if not metadata_paths:
+    metadata_paths = list((case / 'recordings').glob('*.json')) if output == 'record' else []
+    if output == 'record' and not metadata_paths:
         issues.append('Recording metadata was not generated')
-    else:
+    elif metadata_paths:
         metadata = [json.loads(path.read_text()) for path in metadata_paths]
         if not any(item.get('sessionCompleted') is True for item in metadata):
             issues.append('Recording metadata did not finalize')
         if not any(entry.get('isComplete') for item in metadata for entry in item.get('files', [])):
             issues.append('Recording file metadata did not mark output complete')
+        if not all(item.get('layout') == layout for item in metadata):
+            issues.append('Metadata did not preserve requested layout')
     metrics['validation_errors'] = issues
     write_json(case / 'metrics.json', metrics)
     if issues:
@@ -319,13 +348,13 @@ def check_recording(file, case, expect_multi):
     return metrics
 
 
-def test_case(name, users, decode_mode, layout, publishers):
+def execute_case(name, users, decode_mode, layout, publishers, output='record'):
     case = ROOT / name
     case.mkdir()
     (case / 'recordings').mkdir()
     egress_config = {
         'server': {'health_port': 18192, 'workers': 1, 'region': '', 'task_ttl': 600,
-                   'worker_patterns': ['egress:record:*', 'egress:*:record:*']},
+                   'worker_patterns': ['egress:' + output + ':*', 'egress:*:' + output + ':*']},
         'redis': {'addr': '127.0.0.1:6379', 'password': '', 'db': 15},
         'agora': {'app_id': APP_ID, 'channel_name': '', 'access_token': '', 'egress_uid': '42', 'rtc_timeout': 15},
         'snapshots': {'output_dir': str(case / 'snapshots'), 'width': 1280, 'height': 720,
@@ -340,7 +369,7 @@ def test_case(name, users, decode_mode, layout, publishers):
     write_json(case / 'egress_config.json', egress_config)
     process = start([str(PROJECT / 'bin/egress'), '--config', str(case / 'egress_config.json')], case / 'egress.log')
     result = {'case': name, 'users': users, 'decode_mode': decode_mode, 'layout': layout,
-              'publisher_count': len(publishers), 'status': 'FAIL'}
+              'publisher_count': len(publishers), 'output': output, 'status': 'FAIL'}
     log('RUN ' + name + ' (' + str(len(publishers)) + ' active publisher(s))')
     try:
         wait_health('http://127.0.0.1:18192/health', process)
@@ -348,10 +377,20 @@ def test_case(name, users, decode_mode, layout, publishers):
         for publisher in publishers:
             if publisher.poll() is not None:
                 raise RuntimeError('Publisher stopped before recording')
+        payload = {'channel': CHANNEL, 'access_token': token(42), 'workerUid': 42,
+                   'users': users, 'layout': layout, 'videoDecodeMode': decode_mode}
+        if layout == 'customized':
+            payload.update({'width': 1280, 'height': 720,
+                            'regions': ([{'uid': '1001', 'x': 0, 'y': 0, 'width': 1280, 'height': 720, 'z': 0},
+                                         {'uid': '1002', 'x': 896, 'y': 504, 'width': 384, 'height': 216, 'z': 1}]
+                                        if len(publishers) > 1 else
+                                        [{'uid': '1001', 'x': 320, 'y': 180, 'width': 640, 'height': 360, 'z': 0}])})
+        if output != 'record':
+            payload['output_url'] = ('rtmp://127.0.0.1:18235/' + name if output == 'rtmp'
+                                     else 'http://127.0.0.1:18289/' + name + '/whip')
+            payload['output_timeout_ms'] = 5000
         response = request(API_URL + '/tasks', {
-            'request_id': 'e2e' + str(time.time_ns()), 'cmd': 'record', 'action': 'start',
-            'payload': {'channel': CHANNEL, 'access_token': token(42), 'workerUid': 42,
-                        'users': users, 'layout': layout, 'videoDecodeMode': decode_mode}})
+            'request_id': 'e2e' + str(time.time_ns()), 'cmd': output, 'action': 'start', 'payload': payload})
         task_id = response.get('task_id')
         if not task_id or response.get('status') != 'enqueued':
             raise RuntimeError('Recording task was not enqueued: ' + str(response))
@@ -377,11 +416,13 @@ def test_case(name, users, decode_mode, layout, publishers):
         for publisher in publishers:
             if publisher.poll() is not None:
                 raise RuntimeError('Publisher stopped during recording')
-        files = list((case / 'recordings').glob('*.mp4'))
+        files = list((case / 'recordings').glob('*.mp4')) if output == 'record' else list((ROOT / 'received' / name).glob('*.mp4'))
         if len(files) != 1:
             raise RuntimeError('Expected one fresh MP4 output, found ' + str(len(files)))
         result['recording'] = str(files[0].relative_to(ROOT))
-        metrics = check_recording(files[0], case, len(publishers) > 1)
+        metrics = check_recording(files[0], case, len(publishers) > 1, layout, users, output)
+        if output == 'whip' and streaming_e2e.sessions():
+            raise RuntimeError('WHIP receiver session remained after task stop')
         result.update({'status': 'PASS', 'recording': str(files[0].relative_to(ROOT)), 'metrics': metrics})
         log('PASS ' + name + ': video=' + str(metrics['video_duration']) + 's audio=' + str(metrics['audio_duration']) +
             's, tones=' + str(metrics['audio_tone_amplitudes']))
@@ -396,6 +437,12 @@ def test_case(name, users, decode_mode, layout, publishers):
         write_json(case / 'result.json', result)
         write_json(ROOT / 'results.json', {'commit': COMMIT, 'channel': CHANNEL,
                                          'record_seconds': args.seconds, 'results': RESULTS})
+
+
+def test_case(name, users, decode_mode, layout, publishers, output='record'):
+    for index in range(args.repeat):
+        case_name = name if args.repeat == 1 else name + '_repeat_' + str(index + 1)
+        execute_case(case_name, users, decode_mode, layout, publishers, output)
 
 
 def main():
@@ -434,6 +481,19 @@ def main():
     write_json(ROOT / 'api_config.json', api_config)
     api = start([str(PROJECT / 'bin/api-server'), '--config', str(ROOT / 'api_config.json')], ROOT / 'logs/api.log')
     wait_health('http://127.0.0.1:18191/health', api)
+    if args.receiver:
+        receiver_config = ROOT / 'receiver.json'
+        write_json(receiver_config, streaming_e2e.receiver_config(ROOT))
+        receiver = start([str(args.receiver.resolve()), str(receiver_config)], ROOT / 'logs/receiver.log')
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                streaming_e2e.sessions()
+                break
+            except Exception:
+                if receiver.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError('Streaming receiver did not become ready')
+                time.sleep(0.1)
     publisher_1 = start([str(STREAM), '--app-id', APP_ID, '--channel', CHANNEL, '--rtc-user-id', '1001',
                          '--token', token(1001), '--mode', 'encoded', str(source_1)], ROOT / 'logs/publisher_1001.log', env=STREAM_ENV)
     wait_ready(publisher_1)
@@ -443,10 +503,16 @@ def main():
                     ('single_flat_ffmpeg', ['1001'], 1, 'flat'),
                     ('single_flat_sdk', ['1001'], 2, 'flat'),
                     ('single_spotlight_auto', ['1001'], -1, 'spotlight'),
-                    ('single_spotlight_ffmpeg', ['1001'], 1, 'spotlight')]
+                    ('single_spotlight_ffmpeg', ['1001'], 1, 'spotlight'),
+                    ('single_customized_auto', ['1001'], -1, 'customized')]
     for name, users, mode, layout in single_cases:
-        if not args.filter or args.filter in name:
+        if not args.filter or any(part in name for part in args.filter.split(',')):
             test_case(name, users, mode, layout, [publisher_1])
+    if args.receiver:
+        for protocol in ['rtmp', 'whip']:
+            name = 'single_' + protocol
+            if not args.filter or any(part in name for part in args.filter.split(',')):
+                test_case(name, ['1001'], -1, 'flat', [publisher_1], protocol)
     publisher_2 = start([str(STREAM), '--app-id', APP_ID, '--channel', CHANNEL, '--rtc-user-id', '1002',
                          '--token', token(1002), '--mode', 'encoded', str(source_2)], ROOT / 'logs/publisher_1002.log', env=STREAM_ENV)
     wait_ready(publisher_2)
@@ -458,10 +524,17 @@ def main():
                    ('multi_spotlight_auto', ['1001', '1002'], -1, 'spotlight'),
                    ('multi_spotlight_ffmpeg', ['1001', '1002'], 1, 'spotlight'),
                    ('all_flat_auto', [], -1, 'flat'), ('all_flat_ffmpeg', [], 1, 'flat'),
-                   ('all_spotlight_auto', [], -1, 'spotlight'), ('all_spotlight_ffmpeg', [], 1, 'spotlight')]
+                   ('all_spotlight_auto', [], -1, 'spotlight'), ('all_spotlight_ffmpeg', [], 1, 'spotlight'),
+                   ('multi_customized_auto', ['1001', '1002'], -1, 'customized'),
+                   ('all_customized_auto', [], -1, 'customized')]
     for name, users, mode, layout in multi_cases:
-        if not args.filter or args.filter in name:
+        if not args.filter or any(part in name for part in args.filter.split(',')):
             test_case(name, users, mode, layout, [publisher_1, publisher_2])
+    if args.receiver:
+        for protocol in ['rtmp', 'whip']:
+            name = 'multi_' + protocol
+            if not args.filter or any(part in name for part in args.filter.split(',')):
+                test_case(name, ['1001', '1002'], -1, 'spotlight', [publisher_1, publisher_2], protocol)
     return report_results(COMMIT)
 
 
@@ -480,11 +553,13 @@ def verify_saved_run():
             terminal = json.loads((case / 'task_status.json').read_text())
             if terminal.get('state') != 'STOPPED':
                 raise RuntimeError('Recording did not stop successfully: ' + str(terminal))
-            files = list((case / 'recordings').glob('*.mp4'))
+            output = result.get('output', 'record')
+            files = list((case / 'recordings').glob('*.mp4')) if output == 'record' else list((ROOT / 'received' / result['case']).glob('*.mp4'))
             if len(files) != 1:
                 raise RuntimeError('Expected one fresh MP4 output, found ' + str(len(files)))
             result['recording'] = str(files[0].relative_to(ROOT))
-            result['metrics'] = check_recording(files[0], case, result['publisher_count'] > 1)
+            result['metrics'] = check_recording(files[0], case, result['publisher_count'] > 1,
+                                                result['layout'], result['users'], output)
             result['status'] = 'PASS'
             result['recording'] = str(files[0].relative_to(ROOT))
             log('PASS ' + result['case'])

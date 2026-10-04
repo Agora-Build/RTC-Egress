@@ -23,18 +23,32 @@ RUN sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' /etc/apt/s
     git \
     ca-certificates \
     libssl-dev \
+    libx264-dev \
+    libopus-dev \
+    nasm \
+    patch \
     libavcodec-dev \
     libavformat-dev \
     libavutil-dev \
     libswscale-dev \
     libswresample-dev \
     libyaml-cpp-dev \
+    libgtest-dev \
+    python3 \
+    ffmpeg \
     golang-go \
     binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Create build directory
 WORKDIR /build
+
+# Keep the media backend cached independently of application source changes.
+COPY scripts/build-ffmpeg-whip.sh ./scripts/
+COPY scripts/patches/ ./scripts/patches/
+RUN bash scripts/build-ffmpeg-whip.sh /opt/ffmpeg
+ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/opt/ffmpeg/lib
 
 # Copy only build-required files
 COPY CMakeLists.txt ./
@@ -49,6 +63,7 @@ COPY config/ ./config/
 
 # Build the application (no prettifier for CI)
 RUN ./build.sh ci
+RUN cp -a /opt/ffmpeg/lib/lib*.so* bin/
 
 # Strip debug symbols from binaries for production
 RUN find bin/ -type f -executable -exec strip {} \;
@@ -73,6 +88,8 @@ RUN sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' /etc/apt/s
     libswscale7 \
     libswresample4 \
     libyaml-cpp0.8 \
+    libx264-164 \
+    libopus0 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -91,6 +108,7 @@ RUN mkdir -p /opt/rtc_egress \
 
 # Set working directory
 WORKDIR /opt/rtc_egress
+ENV LD_LIBRARY_PATH=/opt/rtc_egress/bin
 
 # Copy ONLY stripped binaries and configs (NO source code, NO symbols)
 COPY --from=builder --chown=rtc_egress:rtc_egress /build/bin ./bin

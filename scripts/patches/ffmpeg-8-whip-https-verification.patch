@@ -1,0 +1,16 @@
+Enable certificate verification for WHIP's internal HTTP requests. Muxer options
+passed to avformat_write_header do not automatically reach these HTTP connections.
+
+--- a/libavformat/whip.c
++++ b/libavformat/whip.c
+@@ -764,2 +764,3 @@
+     av_dict_set(&opts, "headers", buf, 0);
+     av_dict_set_int(&opts, "chunked_post", 0, 0);
++    av_dict_set_int(&opts, "tls_verify", 1, 0);
+@@ -1629,5 +1630,6 @@
+     av_dict_set(&opts, "headers", buf, 0);
+     av_dict_set_int(&opts, "chunked_post", 0, 0);
++    av_dict_set_int(&opts, "tls_verify", 1, 0);
+     av_dict_set(&opts, "method", "DELETE", 0);
+     ret = ffurl_open_whitelist(&whip_uc, whip->whip_resource_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
+         &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);

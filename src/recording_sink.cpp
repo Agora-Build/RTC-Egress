@@ -22,6 +22,7 @@
 #include "common/ffmpeg_utils.h"
 #include "common/file_utils.h"
 #include "common/log.h"
+#include "include/media_encoder.h"
 #include "include/ts_segment_manager.h"
 
 namespace agora {
@@ -43,6 +44,20 @@ RecordingSink::~RecordingSink() {
     stop();
 }
 
+RecordingSink::UserContext::~UserContext() {
+    av_frame_free(&videoFrame);
+    av_frame_free(&audioFrame);
+    sws_freeContext(swsContext);
+    swr_free(&swrContext);
+    avcodec_free_context(&videoCodecContext);
+    avcodec_free_context(&audioCodecContext);
+    if (formatContext) {
+        if (formatContext->pb && !(formatContext->oformat->flags & AVFMT_NOFILE))
+            avio_closep(&formatContext->pb);
+        avformat_free_context(formatContext);
+    }
+}
+
 bool RecordingSink::initialize(const Config& config) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -58,6 +73,7 @@ bool RecordingSink::initialize(const Config& config) {
     }
 
     config_ = config;
+    audioMixer_.configure(config_.audioSampleRate, config_.audioChannels);
 
     // Create output directory if it doesn't exist
     if (!createOutputDirectory()) {
@@ -103,6 +119,9 @@ bool RecordingSink::initialize(const Config& config) {
         compositorConfig.outputWidth = config_.videoWidth;
         compositorConfig.outputHeight = config_.videoHeight;
         compositorConfig.preserveAspectRatio = true;
+        compositorConfig.layout = config_.layout;
+        compositorConfig.regions = config_.regions;
+        compositorConfig.userOrder = config_.targetUsers;
         compositorConfig.minCompositeIntervalMs = 1000 / config_.videoFps;  // Match video FPS
 
         if (!videoCompositor_->initialize(compositorConfig)) {
@@ -161,7 +180,9 @@ bool RecordingSink::start() {
         session.compositionMode = (config_.mode == VideoCompositor::Mode::Individual)
                                       ? MetadataManager::CompositionMode::Individual
                                       : MetadataManager::CompositionMode::Composite;
-        session.layout = MetadataManager::Layout::Flat;  // Default, can be enhanced later
+        session.layout = config_.layout == "spotlight"    ? MetadataManager::Layout::Spotlight
+                         : config_.layout == "customized" ? MetadataManager::Layout::Customized
+                                                          : MetadataManager::Layout::Flat;
         session.width = config_.videoWidth;
         session.height = config_.videoHeight;
         session.fps = config_.videoFps;
@@ -336,11 +357,7 @@ void RecordingSink::stop() {
         std::lock_guard<std::mutex> lock(audioQueueMutex_);
         audioFrameQueue_ = {};
     }
-    {
-        std::lock_guard<std::mutex> lock(audioMixingMutex_);
-        audioMixingBuffer_.clear();
-        nextAudioMixSample_ = -1;
-    }
+    audioMixer_.reset();
 
     // Cleanup performance caches
     AG_LOG_TS(INFO, "Cleaning up composite resources...");
@@ -733,135 +750,23 @@ bool RecordingSink::setupOutputFormat(AVFormatContext** formatContext,
     return true;
 }
 
-bool RecordingSink::setupVideoEncoder(AVCodecContext** videoCodecContext,
-                                      const std::string& userId) {
-    // Try hardware-accelerated encoders first, then fall back to software
-    struct EncoderCandidate {
-        const char* name;
-        AVPixelFormat pixFmt;
-        bool isHwAccel;
-    };
-
-    std::vector<EncoderCandidate> candidates;
-    candidates.reserve(4);
-
-    if (config_.videoCodec == "libx264" || config_.videoCodec == "h264") {
-        candidates.push_back({"h264_nvenc", AV_PIX_FMT_YUV420P, true});
-        candidates.push_back({"h264_vaapi", AV_PIX_FMT_VAAPI, true});
-        candidates.push_back({"h264_qsv", AV_PIX_FMT_NV12, true});
-        candidates.push_back({"libx264", AV_PIX_FMT_YUV420P, false});
-    } else {
-        // Non-H264 codec: use as-is without hwaccel probing
-        candidates.push_back({config_.videoCodec.c_str(), AV_PIX_FMT_YUV420P, false});
-    }
-
-    const AVCodec* codec = nullptr;
-    AVPixelFormat selectedPixFmt = AV_PIX_FMT_YUV420P;
-    bool usingHwAccel = false;
-
-    for (const auto& candidate : candidates) {
-        codec = avcodec_find_encoder_by_name(candidate.name);
-        if (!codec) continue;
-
-        // For hardware encoders, do a quick open test to verify the device is available
-        if (candidate.isHwAccel) {
-            AVCodecContext* testCtx = avcodec_alloc_context3(codec);
-            if (!testCtx) continue;
-            testCtx->width = config_.videoWidth;
-            testCtx->height = config_.videoHeight;
-            testCtx->time_base = {1, 90000};
-            testCtx->pix_fmt = candidate.pixFmt;
-            testCtx->bit_rate = config_.videoBitrate;
-
-            AVDictionary* testOpts = nullptr;
-            av_dict_set(&testOpts, "preset", "fast", 0);
-            int ret = avcodec_open2(testCtx, codec, &testOpts);
-            av_dict_free(&testOpts);
-            avcodec_free_context(&testCtx);
-
-            if (ret < 0) {
-                AG_LOG_FAST(INFO, "HW encoder %s not available, trying next", candidate.name);
-                continue;
-            }
-        }
-
-        selectedPixFmt = candidate.pixFmt;
-        usingHwAccel = candidate.isHwAccel;
-        AG_LOG_FAST(INFO, "Selected video encoder: %s%s", candidate.name,
-                    usingHwAccel ? " (hardware accelerated)" : " (software)");
-        break;
-    }
-
-    if (!codec) {
-        AG_LOG_FAST(ERROR, "No suitable video encoder found");
-        return false;
-    }
-
-    *videoCodecContext = avcodec_alloc_context3(codec);
-    if (!*videoCodecContext) {
-        AG_LOG_FAST(ERROR, "Failed to allocate video codec context");
-        return false;
-    }
-
-    (*videoCodecContext)->bit_rate = config_.videoBitrate;
-    (*videoCodecContext)->width = config_.videoWidth;
-    (*videoCodecContext)->height = config_.videoHeight;
-    (*videoCodecContext)->time_base = {1, 90000};
-    (*videoCodecContext)->framerate = {config_.videoFps, 1};
-    (*videoCodecContext)->gop_size = config_.videoFps;
-    (*videoCodecContext)->max_b_frames = 0;
-    (*videoCodecContext)->pix_fmt = selectedPixFmt;
-    (*videoCodecContext)->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    (*videoCodecContext)->thread_count = 1;
-    (*videoCodecContext)->thread_type = FF_THREAD_SLICE;
-
-    AVDictionary* opts = nullptr;
-    if (usingHwAccel) {
-        av_dict_set(&opts, "preset", "fast", 0);
-    } else {
-        av_dict_set(&opts, "preset", "fast", 0);
-        av_dict_set(&opts, "tune", "zerolatency", 0);
-        av_dict_set(&opts, "x264-params", "force-cfr=1", 0);
-    }
-    av_dict_set(&opts, "fflags", "+flush_packets", 0);
-
-    if (avcodec_open2(*videoCodecContext, codec, &opts) < 0) {
-        AG_LOG_FAST(ERROR, "Failed to open video codec: %s", codec->name);
-        av_dict_free(&opts);
-        return false;
-    }
-
-    av_dict_free(&opts);
-    return true;
+bool RecordingSink::setupVideoEncoder(AVCodecContext** context, const std::string&) {
+    MediaEncoder::VideoConfig config;
+    config.codec = config_.videoCodec;
+    config.width = config_.videoWidth;
+    config.height = config_.videoHeight;
+    config.fps = config_.videoFps;
+    config.bitrate = config_.videoBitrate;
+    return MediaEncoder::openVideo(context, config);
 }
 
-bool RecordingSink::setupAudioEncoder(AVCodecContext** audioCodecContext,
-                                      const std::string& userId) {
-    const AVCodec* codec = avcodec_find_encoder_by_name(config_.audioCodec.c_str());
-    if (!codec) {
-        AG_LOG_FAST(ERROR, "Audio codec not found: %s", config_.audioCodec.c_str());
-        return false;
-    }
-
-    *audioCodecContext = avcodec_alloc_context3(codec);
-    if (!*audioCodecContext) {
-        return false;
-    }
-
-    (*audioCodecContext)->bit_rate = config_.audioBitrate;
-    (*audioCodecContext)->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    // Use the target audio parameters from config (48kHz stereo)
-    (*audioCodecContext)->sample_rate = config_.audioSampleRate;
-    av_channel_layout_default(&(*audioCodecContext)->ch_layout, config_.audioChannels);
-    // Modern best practice time base for audio: 1/90000 (MPEG standard)
-    // This provides high precision while avoiding overflow and is MP4/H.264 standard
-    (*audioCodecContext)->time_base = {1, 90000};
-
-    if (avcodec_open2(*audioCodecContext, codec, nullptr) < 0) {
-        return false;
-    }
-
-    return true;
+bool RecordingSink::setupAudioEncoder(AVCodecContext** context, const std::string&) {
+    MediaEncoder::AudioConfig config;
+    config.codec = config_.audioCodec;
+    config.sampleRate = config_.audioSampleRate;
+    config.channels = config_.audioChannels;
+    config.bitrate = config_.audioBitrate;
+    return MediaEncoder::openAudio(context, config);
 }
 
 bool RecordingSink::encodeVideoFrame(const VideoFrame& frame, const std::string& userId) {
@@ -1290,7 +1195,8 @@ bool RecordingSink::encodeIndividualAudioFrame(const AudioFrame& frame, UserCont
     //           << " from timestamp: " << frame.timestamp << std::endl;
 
     // Allocate buffer for audio frame
-    if (av_frame_get_buffer(context->audioFrame, 0) < 0) {
+    if ((context->audioFrame->data[0] ? av_frame_make_writable(context->audioFrame)
+                                      : av_frame_get_buffer(context->audioFrame, 0)) < 0) {
         AG_LOG_FAST(ERROR, "Failed to make audio frame writable");
         return false;
     }
@@ -1450,146 +1356,18 @@ bool RecordingSink::encodeIndividualAudioFrame(const AudioFrame& frame, UserCont
 }
 
 bool RecordingSink::mixAudioFromMultipleUsers(const AudioFrame& frame, const std::string& userId) {
-    std::lock_guard<std::mutex> lock(audioMixingMutex_);
-    auto& input = audioMixingBuffer_[userId];
-    const auto now = std::chrono::steady_clock::now();
-    const int channels = config_.audioChannels;
-    const int rate = config_.audioSampleRate;
-    const int count = frame.data.size() / sizeof(int16_t) / frame.channels;
-    const auto* data = reinterpret_cast<const int16_t*>(frame.data.data());
-    std::vector<int16_t> converted;
-
-    if (frame.sampleRate != rate || frame.channels != channels) {
-        if (!input.resampler || input.sampleRate != frame.sampleRate ||
-            input.channels != frame.channels) {
-            input.resampler.reset();
-            SwrContext* resampler = nullptr;
-            AVChannelLayout source, destination;
-            av_channel_layout_default(&source, frame.channels);
-            av_channel_layout_default(&destination, channels);
-            int ret = swr_alloc_set_opts2(&resampler, &destination, AV_SAMPLE_FMT_S16, rate,
-                                          &source, AV_SAMPLE_FMT_S16, frame.sampleRate, 0, nullptr);
-            av_channel_layout_uninit(&source);
-            av_channel_layout_uninit(&destination);
-            input.resampler.reset(resampler);
-            if (ret < 0 || !resampler || swr_init(resampler) < 0) return false;
-            input.sampleRate = frame.sampleRate;
-            input.channels = frame.channels;
-        }
-        int capacity = swr_get_out_samples(input.resampler.get(), count);
-        if (capacity < 0) return false;
-        converted.resize(static_cast<size_t>(capacity) * channels);
-        const uint8_t* source[] = {frame.data.data()};
-        uint8_t* destination[] = {reinterpret_cast<uint8_t*>(converted.data())};
-        int produced = swr_convert(input.resampler.get(), destination, capacity, source, count);
-        if (produced < 0) return false;
-        converted.resize(static_cast<size_t>(produced) * channels);
-    } else {
-        input.resampler.reset();
-        converted.assign(data, data + count * channels);
-    }
-
-    int64_t timestampSample = av_rescale_q(frame.timestamp, {1, 1000}, {1, rate});
-    if (nextAudioMixSample_ < 0) {
-        nextAudioMixSample_ = timestampSample;
-        audioMixStart_ = now;
-    }
-    int64_t end = input.firstSample + input.samples.size() / channels;
-    // Preserve PCM continuity across callback jitter; re-anchor a publisher after a real gap.
-    if (input.firstSample < 0 || timestampSample > end + rate / 10) {
-        input.samples.clear();
-        input.firstSample = timestampSample;
-    }
-    input.lastArrival = now;
-    input.samples.insert(input.samples.end(), converted.begin(), converted.end());
-
-    // Bound per-user storage to half a second, even if a producer outruns the encoder.
-    size_t limit = static_cast<size_t>(rate / 2) * channels;
-    while (input.samples.size() > limit) {
-        for (int ch = 0; ch < channels; ++ch) input.samples.pop_front();
-        ++input.firstSample;
-    }
-    return true;
+    return audioMixer_.push(frame, userId);
 }
 
 bool RecordingSink::createMixedAudioFrame(bool flush) {
-    std::lock_guard<std::mutex> mixLock(audioMixingMutex_);
-    std::lock_guard<std::mutex> contextLock(userContextsMutex_);
-    if (nextAudioMixSample_ < 0 || audioMixingBuffer_.empty()) return true;
-    const auto now = std::chrono::steady_clock::now();
-    const auto wait = std::chrono::milliseconds(AUDIO_MIX_WAIT_MS);
-    if (!flush && now - audioMixStart_ < wait) return true;
+    if (audioMixer_.empty()) return true;
+    std::lock_guard<std::mutex> lock(userContextsMutex_);
     if (!compositeContext_ && !initializeEncoder("")) return false;
-    const int channels = config_.audioChannels;
-    const int rate = config_.audioSampleRate;
-    const int count = compositeContext_->audioCodecContext->frame_size;
-    if (count <= 0) return false;
-
-    while (true) {
-        int64_t latest = nextAudioMixSample_;
-        int64_t earliest = INT64_MAX;
-        for (auto& pair : audioMixingBuffer_) {
-            auto& input = pair.second;
-            while (!input.samples.empty() && input.firstSample < nextAudioMixSample_) {
-                for (int ch = 0; ch < channels; ++ch) input.samples.pop_front();
-                ++input.firstSample;
-            }
-            if (!input.samples.empty()) {
-                earliest = std::min(earliest, input.firstSample);
-                latest = std::max(latest, input.firstSample + static_cast<int64_t>(
-                                                                  input.samples.size() / channels));
-            }
-        }
-        if (latest <= nextAudioMixSample_) break;
-        // Leave a timestamp gap when every publisher has been silent for a long time.
-        if (earliest > nextAudioMixSample_ + rate) nextAudioMixSample_ = earliest;
-        int64_t end = nextAudioMixSample_ + count;
-        if (!flush && latest < end) break;
-        if (!flush) {
-            for (const auto& pair : audioMixingBuffer_) {
-                const auto& input = pair.second;
-                int64_t inputEnd = input.firstSample + input.samples.size() / channels;
-                if (input.firstSample < end && inputEnd < end && now - input.lastArrival < wait)
-                    return true;
-            }
-        }
-
-        std::vector<int32_t> mixed(count * channels, 0);
-        for (auto& pair : audioMixingBuffer_) {
-            auto& input = pair.second;
-            while (!input.samples.empty() && input.firstSample < end) {
-                size_t offset = (input.firstSample - nextAudioMixSample_) * channels;
-                for (int ch = 0; ch < channels; ++ch) {
-                    mixed[offset + ch] += input.samples.front();
-                    input.samples.pop_front();
-                }
-                ++input.firstSample;
-            }
-        }
-        int32_t peak = 32767;
-        for (int32_t sample : mixed) peak = std::max(peak, std::abs(sample));
-        std::vector<int16_t> pcm(mixed.size());
-        for (size_t i = 0; i < mixed.size(); ++i)
-            pcm[i] = static_cast<int16_t>(static_cast<int64_t>(mixed[i]) * 32767 / peak);
-
-        AudioFrame frame;
-        frame.data.resize(pcm.size() * sizeof(int16_t));
-        std::memcpy(frame.data.data(), pcm.data(), frame.data.size());
-        frame.sampleRate = rate;
-        frame.channels = channels;
-        frame.timestamp = av_rescale_q(nextAudioMixSample_, {1, rate}, {1, 1000});
-        frame.valid = true;
-        if (!encodeIndividualAudioFrame(frame, compositeContext_.get(), "composite")) return false;
-        nextAudioMixSample_ = end;
-    }
-
-    for (auto it = audioMixingBuffer_.begin(); it != audioMixingBuffer_.end();) {
-        if (it->second.samples.empty() && now - it->second.lastArrival > std::chrono::seconds(1))
-            it = audioMixingBuffer_.erase(it);
-        else
-            ++it;
-    }
-    return true;
+    if (!compositeContext_->audioCodecContext) return true;
+    return audioMixer_.drain(
+        compositeContext_->audioCodecContext->frame_size, flush, [this](const AudioFrame& frame) {
+            return encodeIndividualAudioFrame(frame, compositeContext_.get(), "composite");
+        });
 }
 
 std::pair<int, int> RecordingSink::calculateOptimalLayout(int numUsers) {
@@ -1828,25 +1606,7 @@ void RecordingSink::cleanupEncoder(const std::string& userId) {
         }
     }
 
-    // Cleanup resources
-    if (context->videoCodecContext) {
-        avcodec_free_context(&context->videoCodecContext);
-    }
-    if (context->audioCodecContext) {
-        avcodec_free_context(&context->audioCodecContext);
-    }
-    if (context->formatContext) {
-        if (!(context->formatContext->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&context->formatContext->pb);
-        }
-        avformat_free_context(context->formatContext);
-    }
-    if (context->swsContext) {
-        sws_freeContext(context->swsContext);
-    }
-    if (context->swrContext) {
-        swr_free(&context->swrContext);
-    }
+    // UserContext releases resources when its owner resets it.
 }
 
 std::string RecordingSink::generateOutputFilename(const std::string& userId) {
@@ -2114,10 +1874,7 @@ void RecordingSink::cleanupCompositeResources() {
     compositeFrameTimestamps_.clear();
 
     // Clear audio mixing buffers
-    {
-        std::lock_guard<std::mutex> audioLock(audioMixingMutex_);
-        audioMixingBuffer_.clear();
-    }
+    audioMixer_.reset();
 
     AG_LOG_FAST(INFO, "Cleaned up composite performance caches");
 }

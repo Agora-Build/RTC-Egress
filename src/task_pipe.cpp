@@ -16,6 +16,7 @@
 #include "common/log.h"
 #include "include/recording_sink.h"
 #include "include/uds_message.h"
+#include "line_message_buffer.h"
 #include "rtc_client.h"
 #include "snapshot_sink.h"
 
@@ -118,6 +119,7 @@ void TaskPipe::start(agora::rtc::RtcClient& rtc_client, agora::rtc::SnapshotSink
         // Check which tasks are active
         bool has_active_snapshot = hasActiveTasksOfType("snapshot");
         bool has_active_recording = hasActiveTasksOfType("record");
+        bool has_active_stream = hasActiveTasksOfType("rtmp") || hasActiveTasksOfType("whip");
 
         // Only forward to snapshot sink if snapshots are active
         if (has_active_snapshot && snapshot_sink_) {
@@ -132,6 +134,11 @@ void TaskPipe::start(agora::rtc::RtcClient& rtc_client, agora::rtc::SnapshotSink
                                           frame.yStride, frame.uStride, frame.vStride, frame.width,
                                           frame.height, frame.renderTimeMs, userId);
         }
+        if (has_active_stream) {
+            streaming_sink_.onVideoFrame(frame.yBuffer, frame.uBuffer, frame.vBuffer, frame.yStride,
+                                         frame.uStride, frame.vStride, frame.width, frame.height,
+                                         frame.renderTimeMs, userId);
+        }
     });
 
     rtc_client_->setAudioFrameCallback(
@@ -144,6 +151,11 @@ void TaskPipe::start(agora::rtc::RtcClient& rtc_client, agora::rtc::SnapshotSink
                 recording_sink_->onAudioFrame(reinterpret_cast<const uint8_t*>(frame.buffer),
                                               frame.samplesPerChannel, frame.samplesPerSec,
                                               frame.channels, frame.renderTimeMs, userId);
+            }
+            if (hasActiveTasksOfType("rtmp") || hasActiveTasksOfType("whip")) {
+                streaming_sink_.onAudioFrame(reinterpret_cast<const uint8_t*>(frame.buffer),
+                                             frame.samplesPerChannel, frame.samplesPerSec,
+                                             frame.channels, frame.renderTimeMs, userId);
             }
         });
 
@@ -171,30 +183,14 @@ void TaskPipe::stop() {
         thread_.join();
     }
 
-    // Clean up all connections
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    for (auto& [channel, state] : channel_states_) {
-        if (state.is_connected) {
-            // Check if any snapshot tasks are active
-            bool has_snapshot_tasks = false;
-            bool has_recording_tasks = false;
-            for (const auto& [task_id, task_type] : state.active_tasks) {
-                if (task_type == "snapshot") has_snapshot_tasks = true;
-                if (task_type == "record") has_recording_tasks = true;
-            }
-
-            if (snapshot_sink_ && has_snapshot_tasks) {
-                snapshot_sink_->stop();
-            }
-            if (recording_sink_ && has_recording_tasks) {
-                recording_sink_->stop();
-            }
-            rtc_client_->disconnect();
-        }
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        channel_states_.clear();
     }
-    channel_states_.clear();
-
-    logInfo("Stopped task pipe", instance_id_);
+    if (snapshot_sink_) snapshot_sink_->stop();
+    if (recording_sink_) recording_sink_->stop();
+    streaming_sink_.stop();
+    if (rtc_client_) rtc_client_->disconnect();
 }
 
 void TaskPipe::setSnapshotConfig(const agora::rtc::SnapshotSink::Config& config) {
@@ -220,6 +216,17 @@ void TaskPipe::handleSnapshotCommand(const std::string& action, const UDSMessage
 
         // Update config with channel information
         snapshot_config_.channel = msg.channel;
+        snapshot_config_.taskId = msg.task_id;
+        snapshot_config_.targetUsers = msg.uid;
+        snapshot_config_.mode = msg.uid.size() == 1 && msg.layout != "customized"
+                                    ? agora::rtc::VideoCompositor::Mode::Individual
+                                    : agora::rtc::VideoCompositor::Mode::Composite;
+        snapshot_config_.compositorConfig.layout = msg.layout;
+        snapshot_config_.compositorConfig.regions = msg.regions;
+        snapshot_config_.compositorConfig.userOrder = msg.uid;
+        if (msg.width) snapshot_config_.width = msg.width;
+        if (msg.height) snapshot_config_.height = msg.height;
+        if (msg.interval_in_ms > 0) snapshot_config_.intervalInMs = msg.interval_in_ms;
 
         // Update channel state
         {
@@ -234,7 +241,7 @@ void TaskPipe::handleSnapshotCommand(const std::string& action, const UDSMessage
         }
 
         if (snapshot_sink_ && !snapshot_sink_->isCapturing()) {
-            if (!snapshot_sink_->start()) {
+            if (!snapshot_sink_->initialize(snapshot_config_) || !snapshot_sink_->start()) {
                 logError("Failed to start snapshot sink", instance_id_);
                 releaseConnection(msg.channel, msg.task_id);
                 return;
@@ -331,10 +338,14 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
         // Update configs with channel and task information
         recording_config_.channel = msg.channel;
         recording_config_.taskId = msg.task_id;
+        recording_config_.layout = msg.layout;
+        recording_config_.regions = msg.regions;
+        if (msg.width) recording_config_.videoWidth = msg.width;
+        if (msg.height) recording_config_.videoHeight = msg.height;
 
         // Set recording mode and target users from API request
         recording_config_.targetUsers = msg.uid;
-        if (msg.uid.size() == 1) {
+        if (msg.uid.size() == 1 && msg.layout != "customized") {
             recording_config_.mode = agora::rtc::VideoCompositor::Mode::Individual;
             logInfo("Individual recording mode (single user: " + msg.uid[0] + ")", instance_id_);
         } else {
@@ -345,7 +356,7 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
 
         // Determine video decode mode
         // -1 = auto: single user → passthrough, multiple users → ffmpeg
-        bool isIndividual = (msg.uid.size() == 1);
+        bool isIndividual = recording_config_.mode == agora::rtc::VideoCompositor::Mode::Individual;
         int resolvedMode = msg.videoDecodeMode;
         if (resolvedMode == -1) {
             resolvedMode = isIndividual ? 0 : 1;  // auto: passthrough for single, ffmpeg for multi
@@ -385,20 +396,18 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
             return;
         }
 
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        auto& state = channel_states_[msg.channel];
-
-        // Check if recording is already active (we allow multiple recording tasks)
         bool recording_active = false;
-        for (const auto& [task_id, task_type] : state.active_tasks) {
-            if (task_type == "record") {
-                recording_active = true;
-                break;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            auto& state = channel_states_[msg.channel];
+            for (const auto& [task_id, task_type] : state.active_tasks) {
+                if (task_type == "record") {
+                    recording_active = true;
+                    break;
+                }
             }
+            state.active_tasks[msg.task_id] = "record";
         }
-
-        // Add this recording task
-        state.active_tasks[msg.task_id] = "record";
 
         // Start recording sink if not already running
         if (!recording_active && recording_sink_) {
@@ -533,48 +542,113 @@ void TaskPipe::handleRecordingCommand(const std::string& action, const UDSMessag
 }
 
 void TaskPipe::handleRtmpCommand(const std::string& action, const UDSMessage& msg) {
-    logInfo("RTMP command received (not implemented): " + action, instance_id_);
-    // TODO: Implement RTMP logic
+    handleStreamingCommand(action, msg);
 }
 
 void TaskPipe::handleWhipCommand(const std::string& action, const UDSMessage& msg) {
-    logInfo("WHIP command received (not implemented): " + action, instance_id_);
-    // TODO: Implement WHIP logic
+    handleStreamingCommand(action, msg);
+}
+
+void TaskPipe::handleStreamingCommand(const std::string& action, const UDSMessage& msg) {
+    if (action == "start") {
+        if (msg.channel.empty() || msg.task_id.empty() || hasActiveTasksOfType("rtmp") ||
+            hasActiveTasksOfType("whip")) {
+            sendCompletionMessage(msg.task_id, "failed",
+                                  "Streaming requires an idle sink and a channel");
+            return;
+        }
+        agora::rtc::StreamingSink::Config config;
+        config.taskId = msg.task_id;
+        config.output.protocol = msg.cmd == "rtmp" ? agora::rtc::StreamingOutput::Protocol::RTMP
+                                                   : agora::rtc::StreamingOutput::Protocol::WHIP;
+        config.output.url = msg.output_url;
+        config.output.token = msg.output_token;
+        config.output.timeoutMs = msg.output_timeout_ms;
+        config.targetUsers = msg.uid;
+        config.layout = msg.layout;
+        config.regions = msg.regions;
+        if (msg.width) config.width = msg.width;
+        if (msg.height) config.height = msg.height;
+        streaming_sink_.setCompletionCallback([this](const std::string& taskId,
+                                                     const std::string& status,
+                                                     const std::string& message) {
+            std::string channel;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                for (const auto& pair : channel_states_) {
+                    if (pair.second.active_tasks.count(taskId)) {
+                        channel = pair.first;
+                        break;
+                    }
+                }
+            }
+            if (!channel.empty()) {
+                releaseConnection(channel, taskId);
+                sendCompletionMessage(taskId, status, status == "failed" ? message : "", message);
+            }
+        });
+        // Publishing always composes decoded media, including single-user tasks.
+        rtc_client_->config().videoDecodeMode = msg.videoDecodeMode == 2
+                                                    ? agora::rtc::VideoDecodeMode::SdkDecode
+                                                    : agora::rtc::VideoDecodeMode::FfmpegDecode;
+        if (!streaming_sink_.initialize(config) || !streaming_sink_.start()) {
+            streaming_sink_.stop();
+            sendCompletionMessage(msg.task_id, "failed", "Failed to connect streaming destination");
+            return;
+        }
+        if (!ensureConnected(msg.channel, msg.access_token)) {
+            streaming_sink_.stop();
+            sendCompletionMessage(msg.task_id, "failed", "Failed to connect RTC channel");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            channel_states_[msg.channel].active_tasks[msg.task_id] = msg.cmd;
+        }
+        logInfo("Started " + msg.cmd + " publishing for task: " + msg.task_id, instance_id_);
+    } else if (action == "stop") {
+        std::string channel, taskId;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            for (const auto& pair : channel_states_) {
+                for (const auto& task : pair.second.active_tasks) {
+                    if (task.second == msg.cmd &&
+                        (msg.task_id.empty() ? pair.first == msg.channel
+                                             : task.first == msg.task_id)) {
+                        channel = pair.first;
+                        taskId = task.first;
+                        break;
+                    }
+                }
+                if (!taskId.empty()) break;
+            }
+        }
+        if (taskId.empty()) return;
+        streaming_sink_.stop();
+        bool failed = streaming_sink_.hasFailed();
+        releaseConnection(channel, taskId);
+        sendCompletionMessage(taskId, failed ? "failed" : "success",
+                              failed ? "Streaming destination failed" : "", "Streaming stopped");
+    } else if (action == "status") {
+        logInfo(msg.cmd + " publishing active: " + std::to_string(streaming_sink_.isStreaming()),
+                instance_id_);
+    } else {
+        sendCompletionMessage(msg.task_id, "failed", "Unsupported streaming action");
+    }
 }
 
 // Connection Management
 bool TaskPipe::ensureConnected(const std::string& channel, const std::string& token) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    auto& state = channel_states_[channel];
-
-    if (!state.is_connected) {
-        logInfo("Connecting to channel: " + channel + " (decode mode: " +
-                    std::to_string(static_cast<int>(rtc_client_->config().videoDecodeMode)) + ")",
-                instance_id_);
-
-        rtc_client_->setChannel(channel);
-        if (!token.empty()) {
-            rtc_client_->setAccessToken(token);
-        }
-
-        if (!rtc_client_->connect()) {
-            logError("Failed to connect to channel: " + channel, instance_id_);
-            if (state.active_tasks.empty()) {
-                channel_states_.erase(channel);
-            }
-            return false;
-        }
-
-        state.is_connected = true;
-    } else {
-        // Already connected — decode mode and observers were set during initial connect.
-        // Workers are single-use, so this typically means snapshot + recording share a channel.
-        logInfo("Channel " + channel + " already connected, reusing existing connection",
-                instance_id_);
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = channel_states_.find(channel);
+        if (it != channel_states_.end() && it->second.is_connected) return true;
     }
-
-    logDebug("Channel " + channel + " task count: " + std::to_string(state.active_tasks.size()),
-             instance_id_);
+    rtc_client_->setChannel(channel);
+    if (!token.empty()) rtc_client_->setAccessToken(token);
+    if (!rtc_client_->connect()) return false;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    channel_states_[channel].is_connected = true;
     return true;
 }
 
@@ -614,54 +688,19 @@ void TaskPipe::releaseConnection(const std::string& channel, const std::string& 
 }
 
 void TaskPipe::cleanupConnection(const std::string& channel) {
-    logInfo("Cleaning up connection for channel: " + channel, instance_id_);
-
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    auto it = channel_states_.find(channel);
-    if (it == channel_states_.end()) {
-        return;  // No state found, nothing to clean up
-    }
-
-    auto& state = it->second;
-
-    // Check if any snapshot or recording tasks are active
-    bool has_snapshot_tasks = false;
-    bool has_recording_tasks = false;
-    for (const auto& [task_id, task_type] : state.active_tasks) {
-        if (task_type == "snapshot") has_snapshot_tasks = true;
-        if (task_type == "record") has_recording_tasks = true;
-    }
-
-    if (snapshot_sink_) {
-        logInfo("Always stopping snapshot for channel: " + channel +
-                    " with active tasks: " + std::string(has_snapshot_tasks ? "true" : "false"),
-                instance_id_);
-        snapshot_sink_->stop();
-    }
-
-    if (recording_sink_) {
-        logInfo("Always stopping recording for channel: " + channel +
-                    " with active tasks: " + std::string(has_recording_tasks ? "true" : "false"),
-                instance_id_);
-        recording_sink_->stop();
-    }
-
-    // Clear all active tasks for this channel
-    state.active_tasks.clear();
-
-    // Disconnect from the channel if we're still connected
-    if (rtc_client_ && state.is_connected) {
-        logInfo("Disconnecting from channel: " + channel, instance_id_);
-        rtc_client_->disconnect();
-        state.is_connected = false;
-    }
-
-    // Remove the channel state if no active tasks
-    if (state.active_tasks.empty()) {
+    bool connected = false;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = channel_states_.find(channel);
+        if (it == channel_states_.end()) return;
+        connected = it->second.is_connected;
         channel_states_.erase(it);
     }
-
-    logInfo("Cleanup completed for channel: " + channel, instance_id_);
+    // SDK and sink callbacks also acquire state_mutex_. Stop outside the lock.
+    if (snapshot_sink_) snapshot_sink_->stop();
+    if (recording_sink_) recording_sink_->stop();
+    streaming_sink_.stop();
+    if (rtc_client_ && connected) rtc_client_->disconnect();
 }
 
 // Thread Function
@@ -713,6 +752,7 @@ void TaskPipe::thread_func() {
 
     logInfo("Connected to socket: " + socket_path_, instance_id_);
 
+    LineMessageBuffer messageBuffer;
     // Main loop - read from connected socket
     while (running_) {
         struct timeval tv;
@@ -724,7 +764,7 @@ void TaskPipe::thread_func() {
         FD_SET(sockfd_, &readfds);
         FD_SET(shutdown_pipe_[0], &readfds);
 
-        int max_fd = std::max(sockfd_, shutdown_pipe_[0]) + 1;
+        int max_fd = std::max(sockfd_.load(), shutdown_pipe_[0]) + 1;
 
         int ret = select(max_fd, &readfds, nullptr, nullptr, &tv);
         if (ret < 0) {
@@ -749,14 +789,7 @@ void TaskPipe::thread_func() {
             char buffer[4096];
             ssize_t n = read(sockfd_, buffer, sizeof(buffer) - 1);
             if (n > 0) {
-                buffer[n] = '\0';
-
-                // Handle multiple messages separated by newlines
-                std::string data(buffer, n);
-                std::stringstream ss(data);
-                std::string line;
-
-                while (std::getline(ss, line) && !line.empty()) {
+                bool validSize = messageBuffer.append(buffer, n, [this](const std::string& line) {
                     try {
                         // Parse the message
                         nlohmann::json json = nlohmann::json::parse(line);
@@ -777,11 +810,13 @@ void TaskPipe::thread_func() {
                         } else {
                             logError("Unknown command: " + msg.cmd, instance_id_);
                         }
-                    } catch (const std::exception& e) {
-                        logError("Failed to parse message: " + std::string(e.what()) +
-                                     " - Message: " + line,
-                                 instance_id_);
+                    } catch (const std::exception&) {
+                        logError("Failed to parse or handle UDS message", instance_id_);
                     }
+                });
+                if (!validSize) {
+                    logError("UDS message exceeds 64 KiB", instance_id_);
+                    break;
                 }
             } else if (n == 0) {
                 logInfo("Socket connection closed by manager", instance_id_);
@@ -794,19 +829,21 @@ void TaskPipe::thread_func() {
         }
     }
 
-    // Cleanup
-    if (sockfd_ >= 0) {
-        close(sockfd_);
-        sockfd_ = -1;
+    // Serialize socket teardown with completion writers.
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        if (sockfd_ >= 0) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
     }
 
     logInfo("Task pipe thread exiting", instance_id_);
 }
 
 bool TaskPipe::hasActiveTasksOfType(const std::string& task_type, const bool withLock) const {
-    if (withLock) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-    }
+    std::unique_lock<std::mutex> lock(state_mutex_, std::defer_lock);
+    if (withLock) lock.lock();
 
     for (const auto& [channel, state] : channel_states_) {
         for (const auto& [task_id, type] : state.active_tasks) {
@@ -820,6 +857,7 @@ bool TaskPipe::hasActiveTasksOfType(const std::string& task_type, const bool wit
 
 void TaskPipe::sendCompletionMessage(const std::string& task_id, const std::string& status,
                                      const std::string& error, const std::string& message) {
+    std::lock_guard<std::mutex> lock(send_mutex_);
     if (sockfd_ < 0) {
         logError("Cannot send completion message: socket not connected", instance_id_);
         return;
@@ -836,15 +874,19 @@ void TaskPipe::sendCompletionMessage(const std::string& task_id, const std::stri
         to_json(json, completion);
         std::string data = json.dump() + "\n";
 
-        ssize_t written = write(sockfd_, data.c_str(), data.length());
-        if (written != static_cast<ssize_t>(data.length())) {
-            logError("Failed to send completion message for task " + task_id + ": " +
-                         std::string(strerror(errno)),
-                     instance_id_);
-        } else {
-            logInfo("Sent completion message for task " + task_id + " with status: " + status,
-                    instance_id_);
+        size_t offset = 0;
+        while (offset < data.size()) {
+            ssize_t written =
+                send(sockfd_, data.data() + offset, data.size() - offset, MSG_NOSIGNAL);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                logError("Failed to send completion for task " + task_id, instance_id_);
+                return;
+            }
+            offset += written;
         }
+        logInfo("Sent completion message for task " + task_id + " with status: " + status,
+                instance_id_);
     } catch (const std::exception& e) {
         logError("Failed to serialize completion message for task " + task_id + ": " +
                      std::string(e.what()),
@@ -858,6 +900,7 @@ void TaskPipe::handleSdkError(const std::string& errorType, const std::string& e
     // Stop all active sinks before clearing state
     bool had_active_recording = hasActiveTasksOfType("record");
     bool had_active_snapshot = hasActiveTasksOfType("snapshot");
+    bool had_active_stream = hasActiveTasksOfType("rtmp") || hasActiveTasksOfType("whip");
 
     {
         // Find all active tasks and fail them due to SDK error
@@ -903,6 +946,7 @@ void TaskPipe::handleSdkError(const std::string& errorType, const std::string& e
         logInfo("Snapshot sink stopped successfully", instance_id_);
     }
 
+    if (had_active_stream) streaming_sink_.stop();
     logInfo("All active tasks failed due to SDK error: " + errorType, instance_id_);
 }
 

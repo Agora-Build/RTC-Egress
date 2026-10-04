@@ -640,6 +640,9 @@ func TestValidateStartTaskRequest_AllValidLayouts(t *testing.T) {
 				"layout":       layout,
 			},
 		}
+		if layout == "customized" {
+			req.Payload["regions"] = []LayoutRegion{{UID: "speaker", Width: 640, Height: 480}}
+		}
 		if err := ValidateStartTaskRequest(req); err != nil {
 			t.Fatalf("layout %q should be valid, got error: %v", layout, err)
 		}
