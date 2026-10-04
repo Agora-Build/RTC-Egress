@@ -1,0 +1,28 @@
+Backport FFmpeg fixes a72cc49e8a08dd61cbcf61cac664601c70bc9517 and
+477bf79b06f1d3ec2ce87c8a3dc1f767b0151e8d. Negative random serial numbers
+are rejected by modern Go/Pion receivers, causing intermittent WHIP failures.
+
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -316,5 +316,6 @@
+ static int openssl_gen_certificate(EVP_PKEY *pkey, X509 **cert, char **fingerprint)
+ {
+-    int ret = 0, serial, expire_day;
++    int ret = 0, expire_day;
++    uint64_t serial;
+     const char *aor = "lavf";
+     X509_NAME* subject = NULL;
+@@ -333,5 +334,5 @@
+-    serial = (int)av_get_random_seed();
+-    if (ASN1_INTEGER_set(X509_get_serialNumber(*cert), serial) != 1) {
++    serial = av_get_random_seed();
++    if (ASN1_INTEGER_set_uint64(X509_get_serialNumber(*cert), serial) != 1) {
+         av_log(NULL, AV_LOG_ERROR, "TLS: Failed to set serial, %s\n", ERR_error_string(ERR_get_error(), NULL));
+         goto einval_end;
+     }
+@@ -380,4 +381,4 @@
+-    if (!X509_sign(*cert, pkey, EVP_sha1())) {
++    if (!X509_sign(*cert, pkey, EVP_sha256())) {
+         av_log(NULL, AV_LOG_ERROR, "TLS: Failed to sign certificate, %s\n", ERR_error_string(ERR_get_error(), NULL));
+         goto einval_end;
+     }

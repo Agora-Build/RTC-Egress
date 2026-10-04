@@ -9,6 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' /etc/apt/sources.list && \
     apt-get update && apt-get install -y \
     curl \
+    ca-certificates \
+    libx264-164 \
+    libopus0 \
     libavcodec60 \
     libavformat60 \
     libswscale7 \
@@ -25,7 +28,7 @@ RUN chmod +x ./bin/egress ./bin/eg_worker && chmod 755 /opt /opt/bin || true
 COPY config/ ./config/
 
 # Copy Agora SDK runtime libraries
-COPY bin/*.so ./lib/
+COPY bin/*.so* ./lib/
 
 # Create directory structure
 RUN mkdir -p /opt/config /opt/logs /recordings /snapshots /web_recorder

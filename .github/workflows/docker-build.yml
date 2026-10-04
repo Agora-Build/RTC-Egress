@@ -43,6 +43,22 @@ jobs:
         docker run --rm -v $PWD:/output temp-builder \
           bash -c "cp -r /build/bin /output/ && cp -r /build/agora_sdk /output/"
 
+    - name: Test native layouts and streaming transports
+      run: |
+        docker run --rm -v "$PWD:/checks:ro" temp-builder bash -euc '
+          cmake -S /checks/tests -B /tmp/native-tests -DCMAKE_BUILD_RPATH=/opt/ffmpeg/lib
+          cmake --build /tmp/native-tests -j 4
+          ctest --test-dir /tmp/native-tests --output-on-failure --timeout 120
+          curl --fail --location --silent --show-error \
+            https://github.com/bluenviron/mediamtx/releases/download/v1.21.1/mediamtx_v1.21.1_linux_amd64.tar.gz \
+            --output /tmp/mediamtx.tar.gz
+          printf "%s  %s\n" 653abc672a3e693f8d3b2717752492fdcfb8072291ec108d03d3dd857411b0ee /tmp/mediamtx.tar.gz | sha256sum --check --status
+          tar -xzf /tmp/mediamtx.tar.gz -C /tmp mediamtx
+          python3 /checks/scripts/rtc-egress-streaming-e2e.py --receiver /tmp/mediamtx --fixture /tmp/native-tests/streaming_media_fixture
+          cd /checks
+          go test ./pkg/... ./cmd/...
+        '
+
     - name: Upload binaries as artifacts
       uses: actions/upload-artifact@v4
       with:

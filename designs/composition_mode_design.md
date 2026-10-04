@@ -59,11 +59,11 @@ One user is displayed prominently in a large view, while the remaining users are
 +-------------------+-------+
 ```
 
-- The first user in the list (or the first to join) gets the large view.
-- Other users are arranged as small tiles on the side.
+- The first requested user gets the large view. Without an explicit list, the first observed video publisher gets priority.
+- Landscape canvases use the rightmost 25% for thumbnails; portrait canvases use the bottom 25%.
+- When the primary publisher leaves, an available guest is promoted. A returning primary regains prominence.
 - Useful for presentations, lectures, or any scenario with a primary speaker.
 
-> Note: Spotlight layout is currently defined and accepted by the API but renders the same as flat in the native recorder. Full spotlight rendering is planned for a future release.
 
 ### customized (native recorder)
 
@@ -83,12 +83,13 @@ The API caller specifies exact bounding boxes (x, y, width, height, z-order) for
 +----------------------------------+
 ```
 
-- Each user has an explicit bounding box: `{x, y, width, height, z}`.
-- Z-order controls layering when bounding boxes overlap.
+- Each region has an explicit bounding box: `{uid, x, y, width, height, z}`.
+- Coordinates and dimensions are even pixels for YUV420. Regions must fit the output canvas.
+- Customized layout requires 1 to 32 regions. Optional even `width`/`height` specify the canvas (default 1280x720).
+- Higher z-order covers lower regions; equal z retains array order. Regions are opaque, including black letterboxes or unavailable publishers.
 - Runs on the native C++ recorder (not the web recorder).
 - Useful for picture-in-picture, custom overlays, or branded layouts.
 
-> Note: Customized layout is accepted by the API but bounding box rendering is not yet implemented in the native recorder. Currently renders as flat.
 
 ### freestyle (web recorder only)
 

@@ -103,6 +103,61 @@ class RecordingMediaTest : public ::testing::Test {
                           origin + tick * 10, user);
     }
 
+    void recordAndCheckLayout(const std::string& layout) {
+        auto settings = config();
+        settings.layout = layout;
+        settings.targetUsers = {"z_speaker", "a_guest"};
+        settings.recordAudio = false;
+        settings.taskId = "layout_media";
+        if (layout == "customized")
+            settings.regions = {{"z_speaker", 0, 0, 160, 120, 0}, {"a_guest", 80, 60, 80, 60, 1}};
+        RecordingSink sink;
+        ASSERT_TRUE(sink.initialize(settings));
+        ASSERT_TRUE(sink.start());
+        std::vector<uint8_t> y(160 * 120), uv(80 * 60, 128);
+        const auto start = std::chrono::steady_clock::now();
+        for (int tick = 0; tick < 18; ++tick) {
+            for (const auto& user : settings.targetUsers) {
+                std::fill(y.begin(), y.end(), user == "z_speaker" ? 180 : 80);
+                sink.onVideoFrame(y.data(), uv.data(), uv.data(), 160, 80, 80, 160, 120,
+                                  1000 + tick * 40, user);
+            }
+            std::this_thread::sleep_until(start + std::chrono::milliseconds((tick + 1) * 40));
+        }
+        sink.stop();
+        MediaReader reader;
+        ASSERT_TRUE(reader.open(recording(), AVMEDIA_TYPE_VIDEO));
+        int matching = 0;
+        auto receive = [&] {
+            while (avcodec_receive_frame(reader.decoder, reader.frame) == 0) {
+                int primary = reader.frame->data[0][40 * reader.frame->linesize[0] + 60];
+                int x = layout == "spotlight" ? 140 : 120;
+                int y = layout == "spotlight" ? 60 : 90;
+                int guest = reader.frame->data[0][y * reader.frame->linesize[0] + x];
+                if (std::abs(primary - 180) < 5 && std::abs(guest - 80) < 5) ++matching;
+            }
+        };
+        while (av_read_frame(reader.input, reader.packet) >= 0) {
+            if (reader.packet->stream_index == reader.stream) {
+                ASSERT_GE(avcodec_send_packet(reader.decoder, reader.packet), 0);
+                receive();
+            }
+            av_packet_unref(reader.packet);
+        }
+        ASSERT_GE(avcodec_send_packet(reader.decoder, nullptr), 0);
+        receive();
+        EXPECT_GE(matching, 10);
+        nlohmann::json metadata;
+        for (const auto& entry : std::filesystem::directory_iterator(outputDir_)) {
+            if (entry.path().extension() == ".json") {
+                std::ifstream input(entry.path());
+                input >> metadata;
+            }
+        }
+        EXPECT_EQ(metadata["layout"], layout);
+        EXPECT_TRUE(metadata.value("sessionCompleted", false));
+    }
+
     void decodeAudio(std::vector<float>& samples) {
         MediaReader reader;
         ASSERT_TRUE(reader.open(recording(), AVMEDIA_TYPE_AUDIO));
@@ -393,6 +448,14 @@ TEST_F(RecordingMediaTest, CompositeRetainsBothUsersAcrossPairedCallbacksAndBrie
     }
     ASSERT_GT(sampledFrames, 10);
     EXPECT_GE(framesWithBothUsers, sampledFrames - 5);
+}
+
+TEST_F(RecordingMediaTest, SpotlightRecordingPreservesSpeakerPlacementAndMetadata) {
+    recordAndCheckLayout("spotlight");
+}
+
+TEST_F(RecordingMediaTest, CustomizedRecordingPreservesOverlayPlacementAndMetadata) {
+    recordAndCheckLayout("customized");
 }
 
 TEST_F(RecordingMediaTest, PassthroughAudioResumeKeepsRtcGap) {

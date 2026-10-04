@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "layout_detector.h"
+#include "native_layout.h"
 #include "video_frame.h"
 
 extern "C" {
@@ -32,6 +33,9 @@ class VideoCompositor {
         uint64_t frameTimeoutMs = 2000;  // Match the default layout activity grace period.
         bool preserveAspectRatio = true;
         uint64_t minCompositeIntervalMs = 16;  // 60fps max
+        std::string layout = "flat";
+        std::vector<LayoutRegion> regions;
+        std::vector<std::string> userOrder;
 
         // Layout detection configuration (always enabled for layout stability)
         LayoutDetector::Config layoutDetectorConfig;
@@ -91,14 +95,10 @@ class VideoCompositor {
 
     // Frame buffer and timing
     std::map<std::string, UserFrameInfo> frameBuffer_;
+    std::vector<std::string> arrivalOrder_;
     mutable std::mutex frameBufferMutex_;
     uint64_t lastCompositeTime_ = 0;
     uint64_t droppedFrames_ = 0;
-
-    // Layout caching
-    mutable size_t lastLayoutUserCount_ = 0;
-    mutable int lastCols_ = 0;
-    mutable int lastRows_ = 0;
 
     // Scaling contexts (cached for performance)
     std::map<std::string, SwsContext*> scalingContexts_;
@@ -118,6 +118,7 @@ class VideoCompositor {
     void cleanupScalingContexts();
     uint64_t getCurrentTimeMs() const;
     void onLayoutChange(const std::vector<std::string>& activeUsers);  // LayoutDetector callback
+    std::vector<LayoutRegion> calculateRegions(const std::vector<std::string>& users) const;
 
     struct ScaledFrameInfo {
         int scaledWidth;

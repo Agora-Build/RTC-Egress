@@ -27,9 +27,36 @@ VideoCompositor::~VideoCompositor() {
 }
 
 bool VideoCompositor::initialize(const Config& config) {
+    cleanup();
     std::lock_guard<std::mutex> lock(frameBufferMutex_);
 
+    if (config.outputWidth < 2 || config.outputHeight < 2 || config.outputWidth > 8192 ||
+        config.outputHeight > 8192 || config.outputWidth % 2 || config.outputHeight % 2) {
+        AG_LOG_FAST(ERROR, "Layout canvas dimensions must be even and between 2 and 8192");
+        return false;
+    }
+    if (config.layout != "flat" && config.layout != "spotlight" && config.layout != "customized") {
+        AG_LOG_FAST(ERROR, "Unsupported native layout: %s", config.layout.c_str());
+        return false;
+    }
+    if ((config.layout == "customized" && config.regions.empty()) || config.regions.size() > 32 ||
+        (config.layout != "customized" && !config.regions.empty())) {
+        AG_LOG_FAST(ERROR, "Customized layouts require between 1 and 32 regions");
+        return false;
+    }
+    for (const auto& region : config.regions) {
+        if (region.uid.empty() || region.x < 0 || region.y < 0 || region.width < 2 ||
+            region.height < 2 || region.x % 2 || region.y % 2 || region.width % 2 ||
+            region.height % 2 ||
+            static_cast<int64_t>(region.x) + region.width > config.outputWidth ||
+            static_cast<int64_t>(region.y) + region.height > config.outputHeight) {
+            AG_LOG_FAST(ERROR, "Invalid or out-of-canvas region for user %s", region.uid.c_str());
+            return false;
+        }
+    }
+
     config_ = config;
+    stopRequested_ = false;
 
     if (!setupCompositeFrame()) {
         return false;
@@ -81,6 +108,8 @@ bool VideoCompositor::addUserFrame(const VideoFrame& frame, const std::string& u
     std::lock_guard<std::mutex> lock(frameBufferMutex_);
 
     // Store the frame with current timestamp
+    if (std::find(arrivalOrder_.begin(), arrivalOrder_.end(), userId) == arrivalOrder_.end())
+        arrivalOrder_.push_back(userId);
     frameBuffer_[userId] = {frame, currentTime};
     // Clean up old frames
     cleanupOldFramesWithoutLock();
@@ -155,16 +184,16 @@ bool VideoCompositor::createCompositeFrameWithoutLock(const std::vector<std::str
         return true;  // No frames to composite
     }
 
-    // Update layout if user count changed
-    if (usersWithFrames.size() != lastLayoutUserCount_) {
-        lastLayoutUserCount_ = usersWithFrames.size();
-        auto layout = calculateOptimalLayout(lastLayoutUserCount_);
-        lastCols_ = layout.first;
-        lastRows_ = layout.second;
-    }
-
-    int cellWidth = config_.outputWidth / lastCols_;
-    int cellHeight = config_.outputHeight / lastRows_;
+    std::vector<std::string> ordered;
+    const auto& order = config_.userOrder.empty() ? arrivalOrder_ : config_.userOrder;
+    for (const auto& user : order)
+        if (std::find(usersWithFrames.begin(), usersWithFrames.end(), user) !=
+            usersWithFrames.end())
+            ordered.push_back(user);
+    for (const auto& user : usersWithFrames)
+        if (std::find(ordered.begin(), ordered.end(), user) == ordered.end())
+            ordered.push_back(user);
+    auto regions = calculateRegions(ordered);
 
     // Clear composite frame to black
     if (av_frame_make_writable(compositeFrame_) < 0) {
@@ -178,19 +207,33 @@ bool VideoCompositor::createCompositeFrameWithoutLock(const std::vector<std::str
     memset(compositeFrame_->data[2], 128, compositeFrame_->linesize[2] * config_.outputHeight / 2);
 
     // Composite each user's frame
-    for (size_t i = 0; i < usersWithFrames.size(); ++i) {
-        const std::string& userId = usersWithFrames[i];
-        const VideoFrame& userFrame = frameBuffer_[userId].frame;
-
-        int col = i % lastCols_;
-        int row = i / lastCols_;
+    for (const auto& region : regions) {
+        if (region.width < 2 || region.height < 2) continue;
+        // Custom regions are opaque, including letterboxes and unavailable publishers.
+        if (config_.layout == "customized") {
+            for (int plane = 0; plane < 3; ++plane) {
+                int divisor = plane == 0 ? 1 : 2;
+                for (int y = 0; y < region.height / divisor; ++y)
+                    memset(compositeFrame_->data[plane] +
+                               (region.y / divisor + y) * compositeFrame_->linesize[plane] +
+                               region.x / divisor,
+                           plane == 0 ? 0 : 128, region.width / divisor);
+            }
+        }
+        const std::string& userId = region.uid;
+        if (std::find(usersWithFrames.begin(), usersWithFrames.end(), userId) ==
+            usersWithFrames.end())
+            continue;
+        const VideoFrame& userFrame = frameBuffer_.at(userId).frame;
 
         // Calculate scaled dimensions and position
-        ScaledFrameInfo scaleInfo = calculateScaledFrameInfo(userFrame, cellWidth, cellHeight);
+        ScaledFrameInfo scaleInfo =
+            calculateScaledFrameInfo(userFrame, region.width, region.height);
 
         // Get or create scaling context
         std::string contextKey =
-            getScalingContextKey(userId, scaleInfo.scaledWidth, scaleInfo.scaledHeight);
+            getScalingContextKey(userId, scaleInfo.scaledWidth, scaleInfo.scaledHeight) + "_" +
+            std::to_string(userFrame.width_) + "x" + std::to_string(userFrame.height_);
         SwsContext* swsContext = scalingContexts_[contextKey];
 
         if (!swsContext) {
@@ -231,8 +274,8 @@ bool VideoCompositor::createCompositeFrameWithoutLock(const std::vector<std::str
                   scaledFrame->linesize);
 
         // Calculate final position in composite
-        int destX = col * cellWidth + scaleInfo.offsetX;
-        int destY = row * cellHeight + scaleInfo.offsetY;
+        int destX = region.x + scaleInfo.offsetX;
+        int destY = region.y + scaleInfo.offsetY;
 
         // Copy scaled frame to composite
         for (int plane = 0; plane < 3; ++plane) {
@@ -309,6 +352,7 @@ void VideoCompositor::removeUser(const std::string& userId) {
 void VideoCompositor::clearAllUsers() {
     std::lock_guard<std::mutex> lock(frameBufferMutex_);
     frameBuffer_.clear();
+    arrivalOrder_.clear();
     cleanupScalingContexts();
 }
 
@@ -379,6 +423,7 @@ void VideoCompositor::cleanup() {
     std::lock_guard<std::mutex> lock(frameBufferMutex_);
 
     frameBuffer_.clear();
+    arrivalOrder_.clear();
     cleanupScalingContexts();
 
     if (compositeFrame_) {
@@ -478,10 +523,10 @@ VideoCompositor::ScaledFrameInfo VideoCompositor::calculateScaledFrameInfo(const
         }
 
         // Ensure dimensions are even (required for YUV420P)
-        info.scaledWidth = (info.scaledWidth / 2) * 2;
-        info.scaledHeight = (info.scaledHeight / 2) * 2;
-        info.offsetX = (info.offsetX / 2) * 2;
-        info.offsetY = (info.offsetY / 2) * 2;
+        info.scaledWidth = std::max(2, (info.scaledWidth / 2) * 2);
+        info.scaledHeight = std::max(2, (info.scaledHeight / 2) * 2);
+        info.offsetX = ((cellWidth - info.scaledWidth) / 4) * 2;
+        info.offsetY = ((cellHeight - info.scaledHeight) / 4) * 2;
     } else {
         // Stretch to fill cell
         info.scaledWidth = cellWidth;
@@ -507,9 +552,6 @@ void VideoCompositor::onLayoutChange(const std::vector<std::string>& activeUsers
 
     // Optionally trigger immediate composition when layout changes
     if (initialized_ && !activeUsers.empty()) {
-        // Reset layout cache to force recalculation
-        lastLayoutUserCount_ = 0;
-
         // Create composite frame with new layout
         std::lock_guard<std::mutex> lock(frameBufferMutex_);
         if (videoFrameCallback_) {
@@ -517,6 +559,50 @@ void VideoCompositor::onLayoutChange(const std::vector<std::string>& activeUsers
         }
     }
     AG_LOG_FAST(INFO, "Layout change completed");
+}
+
+std::vector<LayoutRegion> VideoCompositor::calculateRegions(
+    const std::vector<std::string>& users) const {
+    if (config_.layout == "customized") {
+        auto regions = config_.regions;
+        std::stable_sort(regions.begin(), regions.end(),
+                         [](const LayoutRegion& a, const LayoutRegion& b) { return a.z < b.z; });
+        return regions;
+    }
+    std::vector<LayoutRegion> regions;
+    const int width = config_.outputWidth, height = config_.outputHeight;
+    const int count = users.size();
+    if (count == 0) return regions;
+    if (config_.layout == "spotlight" && count > 1) {
+        if (width >= height) {
+            int edge = std::max(2, (width / 8) * 2);
+            regions.push_back({users[0], 0, 0, width - edge, height, 0});
+            for (int i = 1; i < count; ++i) {
+                int top = ((i - 1) * height / (count - 1)) & ~1;
+                int bottom = (i * height / (count - 1)) & ~1;
+                regions.push_back({users[i], width - edge, top, edge, bottom - top, 0});
+            }
+        } else {
+            int edge = std::max(2, (height / 8) * 2);
+            regions.push_back({users[0], 0, 0, width, height - edge, 0});
+            for (int i = 1; i < count; ++i) {
+                int left = ((i - 1) * width / (count - 1)) & ~1;
+                int right = (i * width / (count - 1)) & ~1;
+                regions.push_back({users[i], left, height - edge, right - left, edge, 0});
+            }
+        }
+    } else {
+        auto grid = calculateOptimalLayout(count);
+        for (int i = 0; i < count; ++i) {
+            int col = i % grid.first, row = i / grid.first;
+            int left = (col * width / grid.first) & ~1;
+            int top = (row * height / grid.second) & ~1;
+            int right = ((col + 1) * width / grid.first) & ~1;
+            int bottom = ((row + 1) * height / grid.second) & ~1;
+            regions.push_back({users[i], left, top, right - left, bottom - top, 0});
+        }
+    }
+    return regions;
 }
 
 }  // namespace rtc

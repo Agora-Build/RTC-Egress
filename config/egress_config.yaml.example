@@ -9,8 +9,12 @@ server:
   worker_patterns:    # Native worker subscription patterns
     - "egress:snapshot:*"    # Global native snapshot tasks
     - "egress:record:*"      # Global native recording tasks
+    - "egress:rtmp:*"
+    - "egress:whip:*"
     - "egress:*:snapshot:*"  # Regional native snapshot tasks
     - "egress:*:record:*"    # Regional native recording tasks
+    - "egress:*:rtmp:*"
+    - "egress:*:whip:*"
 
 # Redis Configuration
 redis:

@@ -533,6 +533,12 @@ func TestBuildUDSMessageAllCmdTypes(t *testing.T) {
 				"channel": "demo", "access_token": "token-123456", "workerUid": float64(42),
 			},
 		}
+		if cmd == "rtmp" {
+			task.Payload["output_url"] = "rtmp://localhost/live/test"
+		}
+		if cmd == "whip" {
+			task.Payload["output_url"] = "http://localhost/test/whip"
+		}
 		msg, err := buildUDSMessageFromQueueTask(task)
 		if err != nil {
 			t.Fatalf("cmd %q: unexpected error: %v", cmd, err)

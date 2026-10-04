@@ -52,6 +52,17 @@ std::atomic<int> g_signal_status{0};
 std::mutex g_shutdown_mutex;
 std::condition_variable g_shutdown_cv;
 
+std::vector<agora::rtc::LayoutRegion> readLayoutRegions(const YAML::Node& regions) {
+    if (!regions.IsSequence()) throw std::runtime_error("layout regions must be a sequence");
+    std::vector<agora::rtc::LayoutRegion> result;
+    for (const auto& node : regions) {
+        result.push_back({node["uid"].as<std::string>(), node["x"].as<int>(), node["y"].as<int>(),
+                          node["width"].as<int>(), node["height"].as<int>(),
+                          node["z"] ? node["z"].as<int>() : 0});
+    }
+    return result;
+}
+
 // Signal handler for graceful shutdown
 void signal_handler(int signal) {
     static std::mutex signal_mutex;
@@ -226,6 +237,8 @@ int main(int argc, char* argv[]) {
 
             // Explicitly clean up resources
             AG_LOG_FAST(INFO, "Socket mode cleanup starting...");
+            task_pipe->stop();
+            task_pipe.reset();
             if (g_recordingSink) {
                 AG_LOG_FAST(INFO, "Stopping recording sink in socket mode...");
                 g_recordingSink->stop();
@@ -241,13 +254,6 @@ int main(int argc, char* argv[]) {
                 g_snapshotSink.reset();
                 AG_LOG_FAST(INFO, "Snapshot sink reset in socket mode");
             }
-
-            // Cleanup
-            AG_LOG_FAST(INFO, "Stopping task pipe...");
-            task_pipe->stop();
-            AG_LOG_FAST(INFO, "Task pipe stopped");
-            task_pipe.reset();
-            AG_LOG_FAST(INFO, "Task pipe reset");
 
             if (g_rtcClient) {
                 AG_LOG_FAST(INFO, "Disconnecting RTC client in socket mode...");
@@ -355,6 +361,14 @@ int main(int argc, char* argv[]) {
         // Apply snapshots settings if provided
         if (config["snapshots"]) {
             const auto& snapshots_node = config["snapshots"];
+            if (snapshots_node["layout"]) {
+                snapshots_config.compositorConfig.layout =
+                    snapshots_node["layout"].as<std::string>();
+                snapshots_config.mode = agora::rtc::VideoCompositor::Mode::Composite;
+            }
+            if (snapshots_node["regions"])
+                snapshots_config.compositorConfig.regions =
+                    readLayoutRegions(snapshots_node["regions"]);
 
             // Set output directory (required in config)
             if (!snapshots_node["output_dir"]) {
@@ -406,6 +420,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Configure recording sink
+        snapshots_config.compositorConfig.userOrder = snapshots_config.targetUsers;
         agora::rtc::RecordingSink::Config recording_config;
         recording_config.taskId = session_task_id;      // Set task ID for metadata generation
         recording_config.channel = rtc_config.channel;  // Set channel for metadata
@@ -419,6 +434,10 @@ int main(int argc, char* argv[]) {
                 return -1;
             }
             recording_config.outputDir = recording_node["output_dir"].as<std::string>();
+            if (recording_node["layout"])
+                recording_config.layout = recording_node["layout"].as<std::string>();
+            if (recording_node["regions"])
+                recording_config.regions = readLayoutRegions(recording_node["regions"]);
             // Create output directory if it doesn't exist
             fs::create_directories(recording_config.outputDir);
 
@@ -457,7 +476,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Determine recording mode based on user configuration
-            if (userList.size() == 1) {
+            if (userList.size() == 1 && recording_config.layout != "customized") {
                 // Single user - individual recording (only record this specific user)
                 recording_config.mode = agora::rtc::VideoCompositor::Mode::Individual;
                 AG_LOG_FAST(INFO,
@@ -484,7 +503,7 @@ int main(int argc, char* argv[]) {
 
             // Auto-detect decode mode if not explicitly set
             if (!hasExplicitDecodeMode) {
-                if (userList.size() == 1) {
+                if (recording_config.mode == agora::rtc::VideoCompositor::Mode::Individual) {
                     rtc_config.videoDecodeMode = agora::rtc::VideoDecodeMode::Passthrough;
                     AG_LOG_FAST(INFO, "[Config] Auto decode mode: passthrough (single user)");
                 } else {
