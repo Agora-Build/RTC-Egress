@@ -425,7 +425,7 @@ TEST_F(RecordingMediaTest, PassthroughAudioResumeKeepsRtcGap) {
     EXPECT_GT(toneAmplitude(samples, 440, 0.02, 0.08), 0.14);
 }
 
-TEST_F(RecordingMediaTest, PassthroughResamplesAndDrainsLargeAcceptedAudioCallback) {
+TEST_F(RecordingMediaTest, PassthroughResamplesLargeContinuousCallbacksWithoutAddingGaps) {
     auto settings = config();
     settings.mode = VideoCompositor::Mode::Individual;
     settings.videoDecodeMode = 0;
@@ -441,11 +441,13 @@ TEST_F(RecordingMediaTest, PassthroughResamplesAndDrainsLargeAcceptedAudioCallba
                           .count();
     sink.onAudioFrame(reinterpret_cast<const uint8_t*>(pcm.data()), pcm.size(), 24000, 1, origin,
                       "1001");
+    sink.onAudioFrame(reinterpret_cast<const uint8_t*>(pcm.data()), pcm.size(), 24000, 1,
+                      origin + 200, "1001");
     sink.stop();
     std::vector<float> samples;
     decodeAudio(samples);
-    EXPECT_GE(samples.size(), 9600u);
-    EXPECT_NEAR(samples.size() / 48000.0, 0.2, 0.025);
+    EXPECT_GE(samples.size(), 19200u);
+    EXPECT_NEAR(samples.size() / 48000.0, 0.4, 0.025);
     EXPECT_GT(toneAmplitude(samples, 440, 0.05, 0.15), 0.12);
 }
 

@@ -2971,8 +2971,12 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
     int64_t elapsed =
         static_cast<int64_t>(frame.timestamp) - static_cast<int64_t>(ctx->rtcTimeOrigin);
     int64_t rtcPts = std::max<int64_t>(0, elapsed) * 90;
-    bool gap = ctx->lastBufferedTimestamp > 0 && frame.timestamp > ctx->lastBufferedTimestamp &&
-               frame.timestamp - ctx->lastBufferedTimestamp > 100;
+    int64_t pendingSamples = ctx->audioSampleBuffer.size() / config_.audioChannels;
+    if (ctx->swrContext) pendingSamples += swr_get_delay(ctx->swrContext, config_.audioSampleRate);
+    int64_t pendingPts = av_rescale_q(pendingSamples, {1, config_.audioSampleRate}, {1, 90000});
+    // A long callback can contain continuous audio; compare against its sample timeline.
+    bool gap =
+        ctx->nextAudioPts != AV_NOPTS_VALUE && rtcPts > ctx->nextAudioPts + pendingPts + 9000;
     bool formatChanged = ctx->inputSampleRate > 0 && (ctx->inputSampleRate != frame.sampleRate ||
                                                       ctx->inputChannels != frame.channels);
     if (gap || formatChanged) {
