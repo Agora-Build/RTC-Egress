@@ -15,9 +15,9 @@ void requestStop(int) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 9) {
+    if (argc < 5 || argc > 10) {
         std::cerr << "Usage: streaming_media_fixture rtmp|whip URL USERS SECONDS "
-                     "[ATTEMPTS DELAY_MS MAX_SECONDS TIMEOUT_MS]\n";
+                     "[ATTEMPTS DELAY_MS MAX_SECONDS TIMEOUT_MS IDLE_AFTER_MS]\n";
         return 2;
     }
     agora::rtc::StreamingSink sink;
@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     config.fps = 25;
     int users = std::stoi(argv[3]);
     int seconds = std::stoi(argv[4]);
+    int idleAfterMs = argc > 9 ? std::stoi(argv[9]) : seconds * 1000;
     if (users < 1 || users > 2 || seconds < 1 || seconds > 60) return 2;
     config.targetUsers =
         users == 1 ? std::vector<std::string>{"1001"} : std::vector<std::string>{"1001", "1002"};
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
             std::cout << (reconnecting ? "reconnecting\n" : "recovered\n") << std::flush;
         }
         uint64_t timestamp = 1000 + tick * 10;
-        for (int user = 0; user < users; ++user) {
+        for (int user = 0; user < users && tick * 10 < idleAfterMs; ++user) {
             // RTC audio often starts before the first decoded video keyframe.
             if (tick >= 40 && tick % 4 == 0) {
                 std::vector<uint8_t> y(320 * 180, (user ? 41 : 81) + (tick / 4) % 8);

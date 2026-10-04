@@ -3,8 +3,9 @@
 
 Build tests/ with FFmpeg 8 using CMake first. Supply a MediaMTX v1.21.1 binary
 with --receiver. Tests RTMP H264/AAC and WHIP H264/Opus with one and two users,
-decoded colors/tones, fresh sessions after receiver restarts, bounded retries,
-stop cancellation, task duration deadlines, and WHIP session cleanup.
+decoded colors/tones, initial connection retries, fresh sessions after receiver
+restarts, silent UDP outages, authenticated consent, bounded retries, stop
+cancellation, task duration deadlines, and WHIP session cleanup.
 Artifacts are kept in /tmp; no existing services or recordings are modified.
 """
 
@@ -18,6 +19,8 @@ import socket
 import subprocess
 import time
 import urllib.request
+
+from whip_udp_proxy import WhipUdpProxy
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -104,6 +107,8 @@ def receiver_config(root):
         'hls': False, 'srt': False, 'moq': False, 'webrtc': True, 'webrtcAddress': '127.0.0.1:18289',
         'webrtcLocalUDPAddress': '127.0.0.1:18290', 'webrtcIPsFromInterfaces': False,
         'webrtcAdditionalHosts': ['127.0.0.1'],
+        # Allow a recovered session to stay muted until the fixture ends.
+        'webrtcTrackGatherTimeout': '30s',
         # Keep MediaMTX's normal one-second part duration: earlier header emission can write
         # placeholder SPS/PPS when RTC audio arrives before the first video keyframe.
         'pathDefaults': {'record': True, 'recordPath': str(root / 'received/%path/%Y-%m-%d_%H-%M-%S-%f'),
@@ -152,17 +157,18 @@ def main():
     root = Path('/tmp') / ('rtc-egress-streaming-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     root.mkdir(mode=0o700)
     print('Artifacts: ' + str(root), flush=True)
-    for port in [18235, 18289, 18297]:
+    for port in [18235, 18288, 18289, 18297]:
         with socket.socket() as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('127.0.0.1', port))
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind(('127.0.0.1', 18290))
+    for port in [18290, 18291]:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(('127.0.0.1', port))
     config = root / 'receiver.json'
     config.write_text(json.dumps(receiver_config(root), indent=2) + '\n')
     results = []
     expected = 0
-    receiver = publisher = None
+    receiver = publisher = proxy = None
 
     def selected(name):
         return not args.filter or any(part in name for part in args.filter.split(','))
@@ -184,12 +190,15 @@ def main():
                 time.sleep(0.1)
 
     def start_publisher(case, protocol, users, seconds, attempts=5, delay=1000,
-                        max_seconds=28800, timeout=2000):
+                        max_seconds=28800, timeout=2000, url=None, idle_after_ms=None):
         nonlocal publisher
+        command = [str(args.fixture.resolve()), protocol,
+                   url or destination(protocol, case.name), str(users), str(seconds),
+                   str(attempts), str(delay), str(max_seconds), str(timeout)]
+        if idle_after_ms is not None:
+            command.append(str(idle_after_ms))
         with (case / 'publisher.log').open('w') as output:
-            publisher = subprocess.Popen([str(args.fixture.resolve()), protocol,
-                                          destination(protocol, case.name), str(users), str(seconds),
-                                          str(attempts), str(delay), str(max_seconds), str(timeout)],
+            publisher = subprocess.Popen(command,
                                          cwd=case, stdout=output, stderr=subprocess.STDOUT)
         wait_log(publisher, case / 'publisher.log', 'ready\n')
 
@@ -292,11 +301,164 @@ def main():
                 assert not sessions(), 'WHIP session remained after terminal completion'
                 results.append({'case': name, 'status': 'PASS', 'completion_latency': latency})
                 print('PASS ' + name + ': ' + str(round(latency, 3)) + 's', flush=True)
+
+        for protocol in ['rtmp', 'whip']:
+            for users in [1, 2]:
+                for scenario in ['recovery', 'exhaustion', 'disabled', 'stop', 'duration']:
+                    name = protocol + '_startup_' + scenario + '_' + str(users) + '_users'
+                    if not selected(name):
+                        continue
+                    expected += 1
+                    case = root / name
+                    case.mkdir()
+                    stop(receiver)
+                    attempts = 0 if scenario == 'disabled' else 3
+                    start_publisher(case, protocol, users, args.seconds + 5, attempts=attempts,
+                                    delay=500, max_seconds=1 if scenario == 'duration' else 28800)
+                    log = case / 'publisher.log'
+                    if scenario == 'recovery':
+                        wait_log(publisher, log, 'reconnecting\n')
+                        start_receiver()
+                        wait_log(publisher, log, 'recovered\n')
+                        assert publisher.wait(timeout=args.seconds + 10) == 0
+                        time.sleep(0.5)
+                        files = list((root / 'received' / name).glob('*.mp4'))
+                        assert len(files) == 1, files
+                        metrics = verify(files[0], protocol, users, args.seconds, case, fresh=True)
+                    else:
+                        if scenario == 'stop':
+                            wait_log(publisher, log, 'reconnecting\n')
+                            stopped = time.monotonic()
+                            publisher.terminate()
+                        assert publisher.wait(timeout=8) == (1 if scenario in ('exhaustion', 'disabled') else 0)
+                        content = log.read_text()
+                        if scenario == 'stop':
+                            assert time.monotonic() - stopped < 2
+                            assert 'complete ' not in content, content
+                        elif scenario == 'duration':
+                            assert 'complete success Streaming duration reached' in content, content
+                        else:
+                            assert 'complete failed Streaming destination reconnect exhausted after ' + str(attempts) + ' attempts' in content
+                            assert content.count('reconnect attempt ') == attempts, content
+                        metrics = {'completion': content.split('complete ')[-1].splitlines()[0]}
+                        start_receiver()
+                    assert not sessions(), 'WHIP session remained after startup test'
+                    results.append({'case': name, 'status': 'PASS', 'metrics': metrics})
+                    print('PASS ' + name, flush=True)
+
+        for users in [1, 2]:
+            for scenario in ['stop', 'duration', 'exhaustion']:
+                name = 'whip_initial_ice_' + scenario + '_' + str(users) + '_users'
+                if not selected(name):
+                    continue
+                expected += 1
+                case = root / name
+                case.mkdir()
+                proxy = WhipUdpProxy()
+                proxy.drop_outgoing.set()
+                proxy.drop_incoming.set()
+                start_publisher(case, 'whip', users, 20, attempts=1, delay=100,
+                                max_seconds=2 if scenario == 'duration' else 28800,
+                                timeout=1000 if scenario == 'exhaustion' else 30000,
+                                url='http://127.0.0.1:18288/' + name + '/whip')
+                deadline = time.monotonic() + 3
+                while not proxy.stats['requests'] and publisher.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert proxy.stats['requests'] > 0, 'Initial ICE handshake never started'
+                stopped = time.monotonic()
+                if scenario == 'stop':
+                    publisher.terminate()
+                assert publisher.wait(timeout=6) == (1 if scenario == 'exhaustion' else 0)
+                content = (case / 'publisher.log').read_text()
+                if scenario == 'stop':
+                    assert time.monotonic() - stopped < 2
+                    assert 'complete ' not in content
+                elif scenario == 'duration':
+                    assert 'complete success Streaming duration reached' in content
+                else:
+                    assert 'complete failed Streaming destination reconnect exhausted after 1 attempts' in content
+                    assert content.count('reconnect attempt ') == 1
+                assert not sessions(), 'WHIP session remained after failed initial ICE handshake'
+                assert proxy.error is None, proxy.error
+                results.append({'case': name, 'status': 'PASS', 'proxy': dict(proxy.stats)})
+                print('PASS ' + name + ': ' + json.dumps(proxy.stats), flush=True)
+                proxy.close()
+                proxy = None
+
+        for users in [1, 2]:
+            for scenario in ['both', 'outgoing', 'incoming_forged', 'incoming_replayed',
+                             'idle', 'idle_outage', 'exhaustion', 'stop', 'duration']:
+                name = 'whip_blackhole_' + scenario + '_' + str(users) + '_users'
+                if not selected(name):
+                    continue
+                expected += 1
+                case = root / name
+                case.mkdir()
+                proxy = WhipUdpProxy()
+                idle = scenario in ('idle', 'idle_outage')
+                start_publisher(case, 'whip', users, 16, attempts=2, delay=500,
+                                max_seconds=6 if scenario == 'duration' else 28800,
+                                url='http://127.0.0.1:18288/' + name + '/whip',
+                                idle_after_ms=3000 if idle else None)
+                wait_media(publisher, name)
+                time.sleep(2.5)
+                baseline = proxy.stats['requests']
+                detection = None
+                if scenario == 'idle':
+                    assert publisher.wait(timeout=18) == 0, 'Healthy idle stream failed'
+                    assert proxy.stats['requests'] >= baseline + 5, proxy.stats
+                    assert 'reconnect attempt ' not in (case / 'publisher.log').read_text()
+                else:
+                    if scenario in ('outgoing', 'both', 'idle_outage', 'exhaustion', 'stop', 'duration'):
+                        proxy.drop_outgoing.set()
+                    if scenario != 'outgoing':
+                        proxy.drop_incoming.set()
+                    proxy.forge_responses = scenario == 'incoming_forged'
+                    proxy.replay_responses = scenario == 'incoming_replayed'
+                    outage = time.monotonic()
+                    wait_log(publisher, case / 'publisher.log', 'reconnecting\n', timeout=4)
+                    detection = time.monotonic() - outage
+                    assert 'WHIP ICE consent expired' in (case / 'publisher.log').read_text()
+                    assert detection < 3, detection
+                    if scenario == 'stop':
+                        stopped = time.monotonic()
+                        publisher.terminate()
+                        assert publisher.wait(timeout=3) == 0
+                        assert time.monotonic() - stopped < 2
+                    elif scenario in ('exhaustion', 'duration'):
+                        assert publisher.wait(timeout=9) == (1 if scenario == 'exhaustion' else 0)
+                        expected_message = ('complete failed Streaming destination reconnect exhausted after 2 attempts'
+                                            if scenario == 'exhaustion'
+                                            else 'complete success Streaming duration reached')
+                        assert expected_message in (case / 'publisher.log').read_text()
+                    else:
+                        proxy.drop_outgoing.clear()
+                        proxy.drop_incoming.clear()
+                        wait_log(publisher, case / 'publisher.log', 'recovered\n', timeout=6)
+                        assert publisher.wait(timeout=18) == 0
+                        if not idle:
+                            time.sleep(0.5)
+                            files = sorted((root / 'received' / name).glob('*.mp4'))
+                            assert len(files) == 2, files
+                            verify(files[-1], 'whip', users, 6, case, fresh=True)
+                    if scenario == 'incoming_forged':
+                        assert proxy.stats['forged'] > 0, proxy.stats
+                    if scenario == 'incoming_replayed':
+                        assert proxy.stats['replayed'] > 0, proxy.stats
+                assert not sessions(), 'WHIP session remained after blackhole test'
+                assert proxy.error is None, proxy.error
+                results.append({'case': name, 'status': 'PASS', 'proxy': dict(proxy.stats),
+                                'detection_seconds': detection})
+                print('PASS ' + name + ': ' + json.dumps(proxy.stats), flush=True)
+                proxy.close()
+                proxy = None
     except Exception as error:
         results.append({'case': 'run', 'status': 'FAIL', 'error': str(error)})
         print('FAIL: ' + str(error), flush=True)
     finally:
         stop(publisher)
+        if proxy:
+            proxy.close()
         stop(receiver)
         (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
     return 0 if expected and len(results) == expected and all(item['status'] == 'PASS' for item in results) else 1

@@ -1,0 +1,227 @@
+Add authenticated ICE consent checks, idle polling and bounded failed-startup teardown.
+--- a/libavformat/whip.c
++++ b/libavformat/whip.c
+@@ -290,6 +290,13 @@
+
+     /* The timeout in milliseconds for ICE and DTLS handshake. */
+     int handshake_timeout;
++    /* Authenticated consent responses, including when no media is published. */
++    int consent_timeout;
++    int64_t consent_last_response;
++    int64_t consent_next_probe;
++    uint8_t consent_tid[32][12];
++    int64_t consent_sent[32];
++    unsigned consent_slot;
+     /**
+      * The size of RTP packet, should generally be set to MTU.
+      * Note that pion requires a smaller value, for example, 1200.
+@@ -995,9 +1002,11 @@
+     avio_write(pb, username, ret); /* bytes of username */
+     ffio_fill(pb, 0, (4 - (ret % 4)) % 4); /* padding */
+
+-    /* Write the use-candidate attribute */
+-    avio_wb16(pb, STUN_ATTR_USE_CANDIDATE); /* attribute type use-candidate */
+-    avio_wb16(pb, 0); /* size of use-candidate */
++    /* Nomination belongs to connectivity checks, not subsequent consent requests. */
++    if (whip->state < WHIP_STATE_DTLS_FINISHED) {
++        avio_wb16(pb, STUN_ATTR_USE_CANDIDATE);
++        avio_wb16(pb, 0);
++    }
+
+     /* Build and update message integrity */
+     avio_wb16(pb, STUN_ATTR_MESSAGE_INTEGRITY); /* attribute type message integrity */
+@@ -1176,6 +1185,103 @@
+         return ret;
+     }
+
++    return 0;
++}
++
++/* Only a fresh, authenticated response to our own probe renews consent. */
++static int ice_consent_response(AVFormatContext *s, const uint8_t *buf, int size)
++{
++    WHIPContext *whip = s->priv_data;
++    int slot, pos, len, i, difference;
++    int64_t now = av_gettime_relative();
++    uint8_t header[20], digest[20];
++    AVHMAC *hmac;
++
++    if (!ice_is_binding_response((uint8_t *)buf, size) ||
++        AV_RB32(buf + 4) != STUN_MAGIC_COOKIE ||
++        AV_RB16(buf + 2) + 20 != size || (size & 3))
++        return 0;
++
++    for (slot = 0; slot < FF_ARRAY_ELEMS(whip->consent_tid); slot++) {
++        if (whip->consent_sent[slot] &&
++            now - whip->consent_sent[slot] <= (int64_t)whip->consent_timeout * 1000 &&
++            !memcmp(buf + 8, whip->consent_tid[slot], 12))
++            break;
++    }
++    if (slot == FF_ARRAY_ELEMS(whip->consent_tid))
++        return 0;
++
++    for (pos = 20; pos + 4 <= size; pos += 4 + ((len + 3) & ~3)) {
++        len = AV_RB16(buf + pos + 2);
++        if (len > size - pos - 4)
++            return 0;
++        if (AV_RB16(buf + pos) != STUN_ATTR_MESSAGE_INTEGRITY)
++            continue;
++        if (len != 20)
++            return 0;
++        hmac = av_hmac_alloc(AV_HMAC_SHA1);
++        if (!hmac)
++            return AVERROR(ENOMEM);
++        memcpy(header, buf, sizeof(header));
++        /* RFC 5389: header length includes MESSAGE-INTEGRITY, HMAC input excludes it. */
++        AV_WB16(header + 2, pos + 4);
++        av_hmac_init(hmac, whip->ice_pwd_remote, strlen(whip->ice_pwd_remote));
++        av_hmac_update(hmac, header, sizeof(header));
++        av_hmac_update(hmac, buf + 20, pos - 20);
++        av_hmac_final(hmac, digest, sizeof(digest));
++        av_hmac_free(hmac);
++        difference = 0;
++        for (i = 0; i < sizeof(digest); i++)
++            difference |= digest[i] ^ buf[pos + 4 + i];
++        if (difference)
++            return 0;
++        whip->consent_sent[slot] = 0; /* A replay cannot renew consent twice. */
++        whip->consent_last_response = now;
++        return 0;
++    }
++    return 0;
++}
++
++static int ice_consent_poll(AVFormatContext *s)
++{
++    WHIPContext *whip = s->priv_data;
++    int i, ret, size;
++    int64_t now;
++
++    /* Bound work per call so unsolicited UDP traffic cannot starve media or stop. */
++    for (i = 0; i < 32; i++) {
++        ret = ffurl_read(whip->udp, whip->buf, sizeof(whip->buf));
++        if (ret == AVERROR(EAGAIN))
++            break;
++        if (ret < 0)
++            return ret;
++        if (ice_is_binding_response(whip->buf, ret)) {
++            if ((ret = ice_consent_response(s, whip->buf, ret)) < 0)
++                return ret;
++        } else if (ice_is_binding_request(whip->buf, ret)) {
++            if ((ret = ice_handle_binding_request(s, whip->buf, ret)) < 0)
++                return ret;
++        } else if (is_dtls_packet(whip->buf, ret)) {
++            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0)
++                return ret;
++        }
++    }
++
++    now = av_gettime_relative();
++    if (now - whip->consent_last_response >= (int64_t)whip->consent_timeout * 1000) {
++        av_log(whip, AV_LOG_ERROR, "WHIP ICE consent expired after %d ms\n", whip->consent_timeout);
++        return AVERROR(ETIMEDOUT);
++    }
++    if (now >= whip->consent_next_probe) {
++        unsigned slot = whip->consent_slot++ % FF_ARRAY_ELEMS(whip->consent_tid);
++        if ((ret = ice_create_request(s, whip->buf, sizeof(whip->buf), &size)) < 0)
++            return ret;
++        memcpy(whip->consent_tid[slot], whip->buf + 8, 12);
++        whip->consent_sent[slot] = now;
++        if ((ret = ffurl_write(whip->udp, whip->buf, size)) < 0)
++            return ret;
++        whip->consent_next_probe = now + FFMIN(1000, whip->consent_timeout / 3) * 1000;
++    }
+     return 0;
+ }
+
+@@ -1607,6 +1713,11 @@
+  * should expire and close the session immediately, so that publishers can republish
+  * the stream quickly.
+  */
++static int whip_dispose_interrupt(void *opaque)
++{
++    return av_gettime_relative() >= *(int64_t *)opaque;
++}
++
+ static int dispose_session(AVFormatContext *s)
+ {
+     int ret;
+@@ -1614,6 +1725,9 @@
+     URLContext *whip_uc = NULL;
+     AVDictionary *opts = NULL;
+     WHIPContext *whip = s->priv_data;
++    /* Init failure deinitializes inside libavformat, before the caller can reset cancellation. */
++    int64_t deadline = av_gettime_relative() + 1000000;
++    AVIOInterruptCB cleanup = { whip_dispose_interrupt, &deadline };
+
+     if (!whip->whip_resource_url)
+         return 0;
+@@ -1631,7 +1745,7 @@
+     av_dict_set_int(&opts, "chunked_post", 0, 0);
+     av_dict_set_int(&opts, "tls_verify", 1, 0);
+     av_dict_set(&opts, "method", "DELETE", 0);
+-    ret = ffurl_open_whitelist(&whip_uc, whip->whip_resource_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
++    ret = ffurl_open_whitelist(&whip_uc, whip->whip_resource_url, AVIO_FLAG_READ_WRITE, &cleanup,
+         &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+     if (ret < 0) {
+         av_log(whip, AV_LOG_ERROR, "Failed to DELETE url=%s\n", whip->whip_resource_url);
+@@ -1771,6 +1885,8 @@
+     if ((ret = create_rtp_muxer(s)) < 0)
+         goto end;
+
++    whip->consent_last_response = av_gettime_relative();
++
+ end:
+     if (ret < 0 && whip->state < WHIP_STATE_FAILED)
+         whip->state = WHIP_STATE_FAILED;
+@@ -1783,27 +1899,13 @@
+ {
+     int ret;
+     WHIPContext *whip = s->priv_data;
+-    AVStream *st = s->streams[pkt->stream_index];
+-    AVFormatContext *rtp_ctx = st->priv_data;
+-
+-    /* TODO: Send binding request every 1s as WebRTC heartbeat. */
+-
+-    /**
+-     * Receive packets from the server such as ICE binding requests, DTLS messages,
+-     * and RTCP like PLI requests, then respond to them.
+-     */
+-    ret = ffurl_read(whip->udp, whip->buf, sizeof(whip->buf));
+-    if (ret > 0) {
+-        if (is_dtls_packet(whip->buf, ret)) {
+-            if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
+-                av_log(whip, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+-                goto end;
+-            }
+-        }
+-    } else if (ret != AVERROR(EAGAIN)) {
+-        av_log(whip, AV_LOG_ERROR, "Failed to read from UDP socket\n");
+-        goto end;
+-    }
++    AVStream *st;
++    AVFormatContext *rtp_ctx;
++
++    if ((ret = ice_consent_poll(s)) < 0 || !pkt)
++        goto end;
++    st = s->streams[pkt->stream_index];
++    rtp_ctx = st->priv_data;
+
+     if (whip->h264_annexb_insert_sps_pps && st->codecpar->codec_id == AV_CODEC_ID_H264) {
+         if ((ret = h264_annexb_insert_sps_pps(s, pkt)) < 0) {
+@@ -1899,6 +2001,7 @@
+ #define ENC AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption options[] = {
+     { "handshake_timeout",  "Timeout in milliseconds for ICE and DTLS handshake.",      OFFSET(handshake_timeout),  AV_OPT_TYPE_INT,    { .i64 = 5000 },    -1, INT_MAX, ENC },
++    { "consent_timeout", "Timeout in milliseconds without authenticated ICE consent.", OFFSET(consent_timeout), AV_OPT_TYPE_INT, { .i64 = 5000 }, 1000, 30000, ENC },
+     { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out", OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1200 },    -1, INT_MAX, ENC },
+     { "authorization",      "The optional Bearer token for WHIP Authorization",         OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
+     { "cert_file",          "The optional certificate file path for DTLS",              OFFSET(cert_file),          AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
+@@ -1923,6 +2026,7 @@
+     .priv_data_size     = sizeof(WHIPContext),
+     .init               = whip_init,
+     .write_packet       = whip_write_packet,
++    .flags_internal     = FF_OFMT_FLAG_ALLOW_FLUSH,
+     .deinit             = whip_deinit,
+     .check_bitstream    = whip_check_bitstream,
+ };

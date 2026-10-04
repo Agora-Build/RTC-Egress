@@ -38,6 +38,7 @@ class StreamingSink {
 
     ~StreamingSink();
     bool initialize(const Config& config);
+    // Accepts the task; destination connection and retries run on the publishing thread.
     bool start();
     void stop();
     bool isStreaming() const {

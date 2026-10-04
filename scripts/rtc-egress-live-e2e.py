@@ -49,14 +49,19 @@ parser.add_argument('--stream-sdk-dir', type=Path, help='SDK library directory m
 parser.add_argument('--verify-run', type=Path, help='Recheck saved recordings without starting services or publishers')
 parser.add_argument('--receiver', type=Path, help='MediaMTX binary to enable real RTMP/WHIP receiver cases')
 parser.add_argument('--restart-receiver', action='store_true', help='Restart the streaming receiver during every RTMP/WHIP case')
+parser.add_argument('--late-receiver', action='store_true', help='Start the receiver after the task enters initial connection retries')
+parser.add_argument('--blackhole-receiver', action='store_true', help='Silently drop WHIP UDP traffic while keeping HTTP available')
+parser.add_argument('--stop-startup', action='store_true', help='Stop the task through the API during initial destination backoff')
 parser.add_argument('--repeat', type=int, default=1, help='Repeat each selected case to check connection lifecycle')
 args = parser.parse_args()
 if args.seconds < 10:
     parser.error('--seconds must be at least 10 for meaningful audio/video verification')
 if args.repeat < 1 or args.repeat > 10:
     parser.error('--repeat must be between 1 and 10')
-if args.restart_receiver and not args.receiver:
-    parser.error('--restart-receiver requires --receiver')
+if (args.restart_receiver or args.late_receiver or args.blackhole_receiver or args.stop_startup) and not args.receiver:
+    parser.error('Receiver fault scenarios require --receiver')
+if sum([args.restart_receiver, args.late_receiver, args.blackhole_receiver, args.stop_startup]) > 1:
+    parser.error('Choose one receiver fault scenario per run')
 STREAM = args.stream_tool.resolve()
 receiver_spec = importlib.util.spec_from_file_location('streaming_e2e', PROJECT / 'scripts/rtc-egress-streaming-e2e.py')
 streaming_e2e = importlib.util.module_from_spec(receiver_spec)
@@ -234,7 +239,8 @@ def report_results(commit):
              str(passed) + ' passed, ' + str(len(RESULTS) - passed) + ' failed.', '',
              '| Case | Result | Detail |', '| --- | --- | --- |']
     for result in RESULTS:
-        detail = result.get('error', 'Video, audio, content, task stop, and metadata checks passed')
+        detail = result.get('error', 'API stop during initial retries passed' if result.get('stopped_during_startup')
+                            else 'Video, audio, content, task stop, and metadata checks passed')
         lines.append('| ' + result['case'] + ' | ' + result['status'] + ' | ' +
                      detail.replace('|', '\\|').replace('\n', ' ') + ' |')
     lines.extend(['', 'Each case directory retains its recording, probe data, sample frames,',
@@ -371,6 +377,7 @@ def check_recording(file, case, expect_multi, layout='flat', users=None, output=
 
 
 def execute_case(name, users, decode_mode, layout, publishers, output='record'):
+    proxy = None
     case = ROOT / name
     case.mkdir()
     (case / 'recordings').mkdir()
@@ -411,6 +418,13 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
             payload['output_url'] = ('rtmp://127.0.0.1:18235/' + name if output == 'rtmp'
                                      else 'http://127.0.0.1:18289/' + name + '/whip')
             payload['output_timeout_ms'] = 5000
+            if args.late_receiver or args.stop_startup:
+                stop(RECEIVER)
+            if args.stop_startup:
+                payload['output_reconnect_delay_ms'] = 10000
+            if output == 'whip' and args.blackhole_receiver:
+                proxy = streaming_e2e.WhipUdpProxy()
+                payload['output_url'] = 'http://127.0.0.1:18288/' + name + '/whip'
         response = request(API_URL + '/tasks', {
             'request_id': 'e2e' + str(time.time_ns()), 'cmd': output, 'action': 'start', 'payload': payload})
         task_id = response.get('task_id')
@@ -418,7 +432,18 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
             raise RuntimeError('Recording task was not enqueued: ' + str(response))
         result['task_id'] = task_id
         write_json(case / 'start_response.json', response)
-        if output != 'record' and args.restart_receiver:
+        if output != 'record' and (args.late_receiver or args.stop_startup):
+            wait_worker_log(process, 'reconnect attempt ')
+            during = request(API_URL + '/tasks/' + task_id + '/status',
+                             {'request_id': 'startup' + str(time.time_ns())})
+            write_json(case / 'startup_status.json', during)
+            if during.get('state') != 'PROCESSING':
+                raise RuntimeError('Task failed during initial retries: ' + str(during))
+            if args.late_receiver:
+                start_receiver()
+                wait_worker_log(process, 'reconnected on attempt ')
+                result['receiver_started_late'] = True
+        if output != 'record' and (args.restart_receiver or proxy):
             # Wait for the receiver to have media before interrupting the outgoing destination.
             deadline = time.monotonic() + 15
             while True:
@@ -433,7 +458,12 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
                            if Path('/proc', str(pid), 'comm').read_text().strip() == 'eg_worker']
             if len(worker_pids) != 1:
                 raise RuntimeError('Expected exactly one native worker before receiver restart')
-            stop(RECEIVER)
+            if proxy:
+                proxy.drop_outgoing.set()
+                proxy.drop_incoming.set()
+                wait_worker_log(process, 'WHIP ICE consent expired')
+            else:
+                stop(RECEIVER)
             wait_worker_log(process, 'reconnect attempt ')
             during = request(API_URL + '/tasks/' + task_id + '/status',
                              {'request_id': 'outage' + str(time.time_ns())})
@@ -441,15 +471,21 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
             if during.get('state') != 'PROCESSING':
                 raise RuntimeError('Task did not remain active during outage: ' + str(during))
             time.sleep(1.2)
-            start_receiver()
+            if proxy:
+                proxy.drop_outgoing.clear()
+                proxy.drop_incoming.clear()
+            else:
+                start_receiver()
             wait_worker_log(process, 'reconnected on attempt ')
             if worker_pids != [pid for pid in descendants(process.pid)
                                if Path('/proc', str(pid), 'comm').read_text().strip() == 'eg_worker']:
                 raise RuntimeError('Native worker changed during receiver restart')
             # Capture a full verification window after reconnection.
-            result['receiver_restarted'] = True
+            result['udp_blackhole' if proxy else 'receiver_restarted'] = True
             result['worker_pids'] = worker_pids
-        time.sleep(args.seconds)
+        if not (output != 'record' and args.stop_startup):
+            time.sleep(args.seconds)
+        stop_started = time.monotonic()
         stopped = request(API_URL + '/tasks/' + task_id + '/stop', {'request_id': 'stop' + str(time.time_ns())})
         write_json(case / 'stop_response.json', stopped)
         deadline = time.monotonic() + 15
@@ -463,6 +499,13 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
         write_json(case / 'task_status.json', terminal)
         if terminal.get('state') != 'STOPPED':
             raise RuntimeError('Recording did not stop successfully: ' + str(terminal))
+        if output != 'record' and args.stop_startup:
+            latency = time.monotonic() - stop_started
+            if latency >= 2:
+                raise RuntimeError('API stop did not interrupt initial backoff: ' + str(latency))
+            result.update({'status': 'PASS', 'stopped_during_startup': True, 'stop_seconds': latency})
+            log('PASS ' + name + ': initial retry stop=' + str(round(latency, 3)) + 's')
+            return
         time.sleep(1)
         if process.poll() is not None:
             raise RuntimeError('Egress exited unexpectedly')
@@ -470,13 +513,17 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
             if publisher.poll() is not None:
                 raise RuntimeError('Publisher stopped during recording')
         files = sorted((case / 'recordings').glob('*.mp4')) if output == 'record' else sorted((ROOT / 'received' / name).glob('*.mp4'))
-        expected_files = 2 if result.get('receiver_restarted') else 1
+        expected_files = 2 if result.get('receiver_restarted') or result.get('udp_blackhole') else 1
         if len(files) != expected_files:
             raise RuntimeError('Expected ' + str(expected_files) + ' MP4 outputs, found ' + str(len(files)))
         result['recording'] = str(files[-1].relative_to(ROOT))
         metrics = check_recording(files[-1], case, len(publishers) > 1, layout, users, output)
         if output == 'whip' and streaming_e2e.sessions():
             raise RuntimeError('WHIP receiver session remained after task stop')
+        if proxy:
+            if proxy.error:
+                raise RuntimeError('UDP fault injector failed: ' + proxy.error)
+            result['proxy'] = dict(proxy.stats)
         result.update({'status': 'PASS', 'recording': str(files[-1].relative_to(ROOT)), 'metrics': metrics})
         log('PASS ' + name + ': video=' + str(metrics['video_duration']) + 's audio=' + str(metrics['audio_duration']) +
             's, tones=' + str(metrics['audio_tone_amplitudes']))
@@ -487,6 +534,10 @@ def execute_case(name, users, decode_mode, layout, publishers, output='record'):
         log('FAIL ' + name + ': ' + result['error'])
     finally:
         stop(process)
+        if proxy:
+            proxy.close()
+        if (args.late_receiver or args.stop_startup) and output != 'record' and RECEIVER.poll() is not None:
+            start_receiver()
         RESULTS.append(result)
         write_json(case / 'result.json', result)
         write_json(ROOT / 'results.json', {'commit': COMMIT, 'channel': CHANNEL,
@@ -511,6 +562,7 @@ def main():
     API_URL = 'http://127.0.0.1:18091/egress/v1/' + APP_ID
     for port in [18091, 18191, 18192]:
         with socket.socket() as test_socket:
+            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             test_socket.bind(('127.0.0.1', port))
     for entry in Path('/proc').iterdir():
         try:
@@ -598,9 +650,16 @@ def verify_saved_run():
             terminal = json.loads((case / 'task_status.json').read_text())
             if terminal.get('state') != 'STOPPED':
                 raise RuntimeError('Recording did not stop successfully: ' + str(terminal))
+            if result.get('stopped_during_startup'):
+                if result['stop_seconds'] >= 2:
+                    raise RuntimeError('Initial retry API stop exceeded deadline')
+                result['status'] = 'PASS'
+                RESULTS.append(result)
+                write_json(case / 'result.json', result)
+                continue
             output = result.get('output', 'record')
             files = sorted((case / 'recordings').glob('*.mp4')) if output == 'record' else sorted((ROOT / 'received' / result['case']).glob('*.mp4'))
-            expected_files = 2 if result.get('receiver_restarted') else 1
+            expected_files = 2 if result.get('receiver_restarted') or result.get('udp_blackhole') else 1
             if len(files) != expected_files:
                 raise RuntimeError('Expected ' + str(expected_files) + ' MP4 outputs, found ' + str(len(files)))
             result['recording'] = str(files[-1].relative_to(ROOT))

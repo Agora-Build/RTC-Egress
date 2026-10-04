@@ -27,6 +27,7 @@ class StreamingOutput {
     bool open(const Config& config, const AVCodecContext* video, const AVCodecContext* audio,
               const std::atomic<bool>* stopping = nullptr, int64_t taskDeadlineUs = 0);
     bool write(AVPacket* packet, bool video, AVRational timeBase);
+    bool poll();
     void cancel();
     void close();
 
@@ -42,6 +43,7 @@ class StreamingOutput {
     std::atomic<int64_t> deadlineUs_{0};
     const std::atomic<bool>* stopping_ = nullptr;
     int64_t taskDeadlineUs_ = 0;
+    int64_t nextPollUs_ = 0;
     bool closing_ = false;
 };
 
