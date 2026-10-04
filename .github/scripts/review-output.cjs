@@ -39,7 +39,7 @@ function readReview(directory, format) {
 async function postReview({ github, context }, { reviewer, headSha, review }) {
   const text = parseReview(review, 'markdown');
   const body = `## \u{1F916} ${reviewer} Code Review\n\nReviewed commit: \`${headSha}\`\n\n${text}`;
-  if (body.length > 65536) {
+  if ([...body].length > 65536) {
     throw new Error('Review output is too long for a GitHub comment.');
   }
   await github.rest.issues.createComment({

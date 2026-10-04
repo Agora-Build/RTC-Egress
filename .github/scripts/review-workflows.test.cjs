@@ -27,7 +27,7 @@ for (const name of ['codex', 'claude']) {
   const workflow = fs.readFileSync(path.join(root, `.github/workflows/${name}-code-review.yml`), 'utf8');
   const authorize = new AsyncFunction('github', 'context', 'core', stepBlock(workflow, 'Check PR author access', 'script'));
 
-  async function checkAccess({ permission = 'write', fork = false, error } = {}) {
+  async function checkAccess({ permission = 'write', roleName = permission, fork = false, error } = {}) {
     const outputs = {};
     let calls = 0;
     const context = {
@@ -38,17 +38,20 @@ for (const name of ['codex', 'claude']) {
       calls++;
       assert.deepEqual(input, { ...context.repo, username: 'review-author' });
       if (error) throw error;
-      return { data: { permission } };
+      return { data: { permission, role_name: roleName } };
     } } } };
     const core = { setOutput: (key, value) => { outputs[key] = value; }, info: () => {} };
     await authorize(github, context, core);
     return { trusted: outputs.trusted, calls };
   }
 
-  for (const permission of ['admin', 'maintain', 'write', 'read', 'triage', 'none']) {
-    test(`${name} author with ${permission} permission is gated correctly`, async () => {
-      assert.deepEqual(await checkAccess({ permission }), {
-        trusted: String(['admin', 'maintain', 'write'].includes(permission)), calls: 1,
+  for (const [roleName, permission, trusted] of [
+    ['admin', 'admin', true], ['maintain', 'write', true], ['write', 'write', true],
+    ['read', 'read', false], ['triage', 'read', false], ['none', 'none', false],
+  ]) {
+    test(`${name} author with ${roleName} role is gated correctly`, async () => {
+      assert.deepEqual(await checkAccess({ permission, roleName }), {
+        trusted: String(trusted), calls: 1,
       });
     });
   }
@@ -69,6 +72,10 @@ for (const name of ['codex', 'claude']) {
     const prompt = stepBlock(workflow, `Run ${name === 'codex' ? 'Codex' : 'Claude'} Code Review`, 'prompt');
     assert.ok(prompt.includes('git diff ${{ github.event.pull_request.base.sha }}...HEAD'));
     assert.ok(!prompt.includes('$PR_BASE_SHA'));
+  });
+
+  test(`${name} review checkout uses the immutable event merge SHA`, () => {
+    assert.match(workflow, /- name: Checkout repository\n\s+uses: actions\/checkout@v5\n\s+with:\n\s+ref: \$\{\{ github.sha \}\}/);
   });
 }
 

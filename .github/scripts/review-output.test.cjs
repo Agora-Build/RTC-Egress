@@ -111,6 +111,14 @@ test('publisher rejects empty or oversized output before calling GitHub', async 
   }
 });
 
+test('publisher counts Unicode characters rather than UTF-16 code units', async () => {
+  let body;
+  const github = { rest: { issues: { createComment: async (comment) => { body = comment.body; } } } };
+  const context = { repo: {}, payload: { pull_request: { number: 6 } } };
+  await postReview({ github, context }, { reviewer: 'Claude', headSha: 'abc123', review: '\u{1F916}'.repeat(60000) });
+  assert.ok([...body].length < 65536);
+});
+
 test('GitHub publication failures fail the posting job', async () => {
   const github = { rest: { issues: { createComment: async () => { throw new Error('GitHub rejected comment'); } } } };
   const context = { repo: {}, payload: { pull_request: { number: 6 } } };

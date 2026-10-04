@@ -39,7 +39,7 @@ jobs:
               core.setOutput('trusted', 'false');
               return;
             }
-            const trusted = ['admin', 'maintain', 'write'].includes(data.permission);
+            const trusted = ['admin', 'write'].includes(data.permission);
             core.info(`Author ${pr.user.login} has repository permission: ${data.permission}`);
             core.setOutput('trusted', String(trusted));
 
@@ -56,7 +56,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 

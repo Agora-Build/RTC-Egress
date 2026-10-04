@@ -34,8 +34,9 @@ Do not put credential values in documentation, review artifacts, or memory.
 
 ## Review And Publication
 
-1. The model job checks out the PR merge ref with full history and no persisted
-   Git credentials. The prompt asks the reviewer to inspect the actual diff
+1. The model job checks out the event's immutable PR merge SHA (`github.sha`)
+   with full history and no persisted Git credentials. Later pushes cannot
+   change which commit is reviewed. The prompt asks the reviewer to inspect the actual diff
    against the event's base SHA. The prompt includes a literal SHA so Claude's
    permission checker can validate the diff command, and treats the changed-file
    summary as untrusted context.
@@ -48,7 +49,8 @@ Do not put credential values in documentation, review artifacts, or memory.
 
 An authorization job checks the author's actual repository permission through
 GitHub's API. Provider-backed reviews run only for same-repository PRs whose
-author has `admin`, `maintain`, or `write` access. Fork PRs and other authors are skipped.
+author has `admin` or `write` permission. GitHub reports the `maintain` role as
+`write` and the `triage` role as `read`. Fork PRs and other authors are skipped.
 An author-access 404 also skips the review; other API failures fail authorization.
 The publisher also runs code from that trusted PR, so this author restriction
 applies to both model access and publication. The standalone workflow tests
