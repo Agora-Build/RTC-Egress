@@ -20,8 +20,8 @@ fi
 printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
 tar -xf "$archive" -C "$build_dir"
 cd "$build_dir/ffmpeg-${version}"
-patch --batch -p1 < "$script_dir/patches/ffmpeg-8-dtls-certificates.patch"
-patch --batch -p1 < "$script_dir/patches/ffmpeg-8-whip-https-verification.patch"
+patch --batch --fuzz=0 -p1 < "$script_dir/patches/ffmpeg-8-dtls-certificates.patch"
+patch --batch --fuzz=0 -p1 < "$script_dir/patches/ffmpeg-8-whip-https-verification.patch"
 
 ./configure --prefix="$prefix" --enable-shared --disable-static --disable-programs \
     --disable-doc --disable-autodetect --disable-avdevice --disable-avfilter \

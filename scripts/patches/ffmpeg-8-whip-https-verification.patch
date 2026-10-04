@@ -3,10 +3,14 @@ passed to avformat_write_header do not automatically reach these HTTP connection
 
 --- a/libavformat/whip.c
 +++ b/libavformat/whip.c
-@@ -764,2 +764,3 @@
+@@ -764,5 +764,6 @@
      av_dict_set(&opts, "headers", buf, 0);
      av_dict_set_int(&opts, "chunked_post", 0, 0);
 +    av_dict_set_int(&opts, "tls_verify", 1, 0);
+-
++
+     hex_data = av_mallocz(2 * strlen(whip->sdp_offer) + 1);
+     if (!hex_data) {
 @@ -1629,5 +1630,6 @@
      av_dict_set(&opts, "headers", buf, 0);
      av_dict_set_int(&opts, "chunked_post", 0, 0);
