@@ -12,19 +12,13 @@ function parseReview(raw, format) {
     }
     const items = (Array.isArray(data) ? data : [data]).filter((item) => item && typeof item === 'object');
     const result = [...items].reverse().find((item) => item.type === 'result');
-    if (result) {
-      if (result.is_error || (result.subtype && result.subtype !== 'success')) {
-        throw new Error('Claude review execution failed.');
-      }
-      review = result.result;
-    } else {
-      // Older action output may contain assistant messages without a final result.
-      const assistant = [...items].reverse().find((item) => item.role === 'assistant' || item.type === 'assistant');
-      const content = assistant && (assistant.content ?? assistant.message?.content);
-      review = typeof content === 'string' ? content : Array.isArray(content)
-        ? content.filter((item) => item.type === 'text').map((item) => item.text || '').join('')
-        : '';
+    if (!result) {
+      throw new Error('Claude review result is missing; execution may be incomplete.');
     }
+    if (result.is_error || (result.subtype && result.subtype !== 'success')) {
+      throw new Error('Claude review execution failed.');
+    }
+    review = result.result;
   } else if (format !== 'markdown') {
     throw new Error(`Unsupported review format: ${format}`);
   }
@@ -56,3 +50,8 @@ async function postReview({ github, context }, { reviewer, headSha, review }) {
 }
 
 module.exports = { parseReview, readReview, postReview };
+
+if (require.main === module) {
+  const [format, input, output] = process.argv.slice(2);
+  fs.writeFileSync(output, parseReview(fs.readFileSync(input, 'utf8'), format) + '\n');
+}

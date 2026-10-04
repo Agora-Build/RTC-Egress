@@ -13,12 +13,13 @@ Configure these repository or organization secrets in GitHub Actions:
 | Secret | Purpose |
 | --- | --- |
 | `OPENAI_API_KEY` | Credential for the OpenAI-compatible review provider |
-| `OPENAI_BASE_URL` | Provider URL before `/v1/responses`, without a trailing slash |
+| `OPENAI_BASE_URL` | HTTPS provider root or `/v1` base URL; trailing slashes are accepted |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic-compatible review provider |
 | `ANTHROPIC_BASE_URL` | Base URL consumed directly by Claude Code |
 
-The Codex action receives `${OPENAI_BASE_URL}/v1/responses` through its
-`responses-api-endpoint` input and uses `gpt-5.6-sol`, matching Vox. A provider
+The workflow normalizes the Codex URL to end in `/v1/responses`, preserving any
+provider path prefix and avoiding duplicate `/v1` segments. The action receives
+it through `responses-api-endpoint` and uses `gpt-5.6-sol`, matching Vox. A provider
 credential sent to the default OpenAI endpoint can fail authentication even
 when the credential works with its intended provider. Missing configuration
 fails before either model starts, with the missing secret's name.
@@ -35,7 +36,9 @@ Do not put credential values in documentation, review artifacts, or memory.
 
 1. The model job checks out the PR merge ref with full history and no persisted
    Git credentials. The prompt asks the reviewer to inspect the actual diff
-   against the event's base SHA, and treats PR metadata as untrusted context.
+   against the event's base SHA. The prompt includes a literal SHA so Claude's
+   permission checker can validate the diff command, and treats the changed-file
+   summary as untrusted context.
 2. The model job has `contents: read` and `pull-requests: read`. It receives its
    provider configuration and produces an artifact; it cannot post a review.
 3. A separate job downloads the artifact, reads the publisher from the triggering
@@ -46,14 +49,16 @@ Do not put credential values in documentation, review artifacts, or memory.
 An authorization job checks the author's actual repository permission through
 GitHub's API. Provider-backed reviews run only for same-repository PRs whose
 author has `admin`, `maintain`, or `write` access. Fork PRs and other authors are skipped.
+An author-access 404 also skips the review; other API failures fail authorization.
 The publisher also runs code from that trusted PR, so this author restriction
 applies to both model access and publication. The standalone workflow tests
 run without provider credentials, including on fork PRs.
 
-Codex stores its final Markdown in `codex-review-output`. Claude stores the
-action's execution JSON in `claude-review-output`. Artifacts expire after
-seven days. Claude's final result takes precedence over intermediate assistant
-text; older output without a result falls back to the last assistant text.
+Codex stores its final Markdown in `codex-review-output`. Claude extracts the
+completed result from the action's execution JSON and uploads only the final
+Markdown in `claude-review-output`. Artifacts expire after seven days. The full
+Claude execution transcript is not uploaded, and assistant messages without a
+completed result fail extraction instead of being posted as a partial review.
 
 A missing artifact, malformed JSON, failed Claude result, empty review, or
 GitHub publication error fails the workflow. Empty output cannot silently
@@ -82,7 +87,7 @@ The separation between model execution and posting is also illustrated in
 Run the behavioral tests and workflow linter:
 
 ```sh
-node --test .github/scripts/review-output.test.cjs
+node --test .github/scripts/*.test.cjs
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck= \
   .github/workflows/codex-code-review.yml \
   .github/workflows/claude-code-review.yml \
@@ -92,6 +97,9 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck= \
 `Review Workflow Tests` runs these checks whenever `.github/` changes. Tests
 cover real Claude output shapes, errors and missing results, literal code in
 review text, artifact validation, comment construction, and GitHub failures.
+They also execute the actual workflow authorization scripts with GitHub API
+mocks, run the provider configuration step with fixture URLs, and check the
+literal-SHA diff prompt.
 
 For a live PR, check that both `review` and `post` jobs succeed and that both
 comments name the current PR head SHA. An artifact or a successful model step

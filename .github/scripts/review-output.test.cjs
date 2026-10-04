@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 const { parseReview, readReview, postReview } = require('./review-output.cjs');
 
@@ -22,7 +23,7 @@ test('Claude accepts a single result object', () => {
   assert.equal(parseReview(JSON.stringify({ type: 'result', result: 'Review complete.' }), 'claude'), 'Review complete.');
 });
 
-test('Claude falls back to the last assistant text if no result exists', () => {
+test('Claude rejects intermediate assistant text if no result exists', () => {
   const output = [
     { role: 'assistant', content: 'Earlier analysis.' },
     { type: 'assistant', message: { content: [
@@ -32,11 +33,11 @@ test('Claude falls back to the last assistant text if no result exists', () => {
       { type: 'text', text: 'finding.' },
     ] } },
   ];
-  assert.equal(parseReview(JSON.stringify(output), 'claude'), 'A real finding.');
+  assert.throws(() => parseReview(JSON.stringify(output), 'claude'), /result is missing/);
 });
 
-test('Claude accepts assistant string content', () => {
-  assert.equal(parseReview(JSON.stringify({ role: 'assistant', content: 'No issues.' }), 'claude'), 'No issues.');
+test('Claude rejects an assistant string without a completed result', () => {
+  assert.throws(() => parseReview(JSON.stringify({ role: 'assistant', content: 'No issues.' }), 'claude'), /result is missing/);
 });
 
 test('failed Claude execution never publishes intermediate text', () => {
@@ -62,7 +63,7 @@ test('missing review text fails for both reviewers', () => {
     [' \n', 'markdown'], ['[]', 'claude'], ['null', 'claude'],
     [JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use' }] } }), 'claude'],
   ]) {
-    assert.throws(() => parseReview(raw, format), /empty/);
+    assert.throws(() => parseReview(raw, format), /empty|result is missing/);
   }
 });
 
@@ -114,4 +115,30 @@ test('GitHub publication failures fail the posting job', async () => {
   const github = { rest: { issues: { createComment: async () => { throw new Error('GitHub rejected comment'); } } } };
   const context = { repo: {}, payload: { pull_request: { number: 6 } } };
   await assert.rejects(postReview({ github, context }, { reviewer: 'Claude', headSha: 'abc123', review: 'Review.' }), /GitHub rejected/);
+});
+
+test('Claude extraction uploads only the completed review text', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-extract-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const input = path.join(directory, 'execution.json');
+  const output = path.join(directory, 'review.md');
+  fs.writeFileSync(input, JSON.stringify([
+    { type: 'user', message: { content: 'Private tool output.' } },
+    { type: 'assistant', message: { content: 'Intermediate analysis.' } },
+    { type: 'result', subtype: 'success', result: 'No actionable findings.' },
+  ]));
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'review-output.cjs'), 'claude', input, output], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(output, 'utf8'), 'No actionable findings.\n');
+});
+
+test('incomplete Claude execution fails extraction without creating an artifact', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-extract-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const input = path.join(directory, 'execution.json');
+  const output = path.join(directory, 'review.md');
+  fs.writeFileSync(input, JSON.stringify([{ type: 'assistant', content: 'Still reviewing.' }]));
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'review-output.cjs'), 'claude', input, output], { encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.ok(!fs.existsSync(output));
 });

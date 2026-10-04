@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: '20'
       - name: Test review output parsing and publication
-        run: node --test .github/scripts/review-output.test.cjs
+        run: node --test .github/scripts/*.test.cjs
       - name: Validate review workflows
         run: >-
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck=
