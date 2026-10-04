@@ -2882,20 +2882,7 @@ void RecordingSink::cleanupPassthroughContext(const std::string& userId) {
     bool complete = ctx->headerWritten;
 
     if (ctx->headerWritten && ctx->audioCodecContext && ctx->audioStream) {
-        if (!ctx->audioSampleBuffer.empty()) {
-            AudioFrame finalFrame;
-            std::vector<int16_t> remaining;
-            remaining.swap(ctx->audioSampleBuffer);
-            remaining.resize(ctx->audioCodecContext->frame_size * config_.audioChannels, 0);
-            finalFrame.data.resize(remaining.size() * sizeof(int16_t));
-            std::memcpy(finalFrame.data.data(), remaining.data(), finalFrame.data.size());
-            finalFrame.sampleRate = config_.audioSampleRate;
-            finalFrame.channels = config_.audioChannels;
-            finalFrame.timestamp =
-                ctx->lastBufferedTimestamp +
-                1000 * ctx->audioCodecContext->frame_size / config_.audioSampleRate;
-            complete = encodePassthroughAudioFrame(finalFrame, ctx, userId) && complete;
-        }
+        complete = writePassthroughAudioSamples(ctx, userId, true) && complete;
         AVPacket* packet = av_packet_alloc();
         int ret = avcodec_send_frame(ctx->audioCodecContext, nullptr);
         if (!packet || ret < 0) {
@@ -2981,139 +2968,118 @@ bool RecordingSink::encodePassthroughAudioFrame(const AudioFrame& frame, Passthr
         ctx->rtcTimeOrigin = frame.timestamp;
         ctx->hasTimeOrigin = true;
     }
-    if (ctx->nextAudioPts == AV_NOPTS_VALUE) {
-        // Anchor AAC to the first buffered sample, rather than the callback that fills a frame.
-        int64_t elapsed =
-            static_cast<int64_t>(frame.timestamp) - static_cast<int64_t>(ctx->rtcTimeOrigin);
-        ctx->nextAudioPts = std::max<int64_t>(0, elapsed) * 90;
+    int64_t elapsed =
+        static_cast<int64_t>(frame.timestamp) - static_cast<int64_t>(ctx->rtcTimeOrigin);
+    int64_t rtcPts = std::max<int64_t>(0, elapsed) * 90;
+    bool gap = ctx->lastBufferedTimestamp > 0 && frame.timestamp > ctx->lastBufferedTimestamp &&
+               frame.timestamp - ctx->lastBufferedTimestamp > 100;
+    bool formatChanged = ctx->inputSampleRate > 0 && (ctx->inputSampleRate != frame.sampleRate ||
+                                                      ctx->inputChannels != frame.channels);
+    if (gap || formatChanged) {
+        if (!writePassthroughAudioSamples(ctx, userId, true)) return false;
+        swr_free(&ctx->swrContext);
     }
+    if (ctx->nextAudioPts == AV_NOPTS_VALUE)
+        ctx->nextAudioPts = rtcPts;
+    else if (gap)
+        ctx->nextAudioPts = std::max(ctx->nextAudioPts, rtcPts);
 
-    // Resampling setup (same logic as encodeIndividualAudioFrame)
-    bool needsResampling =
-        (frame.sampleRate != config_.audioSampleRate || frame.channels != config_.audioChannels);
-
-    if (needsResampling && !ctx->swrContext) {
-        AVChannelLayout in_ch_layout, out_ch_layout;
-        av_channel_layout_default(&in_ch_layout, frame.channels);
-        av_channel_layout_default(&out_ch_layout, config_.audioChannels);
-
-        int ret = swr_alloc_set_opts2(&ctx->swrContext, &out_ch_layout, AV_SAMPLE_FMT_FLTP,
-                                      config_.audioSampleRate, &in_ch_layout, AV_SAMPLE_FMT_S16,
-                                      frame.sampleRate, 0, nullptr);
-        if (ret < 0 || !ctx->swrContext) {
-            AG_LOG_FAST(ERROR, "Passthrough: failed to allocate audio resampler for user %s",
-                        userId.c_str());
-            return false;
-        }
-        ret = swr_init(ctx->swrContext);
-        if (ret < 0) {
-            swr_free(&ctx->swrContext);
-            return false;
-        }
-    }
-
-    // Buffer incoming samples
-    int input_samples = frame.data.size() / sizeof(int16_t) / frame.channels;
-    const int16_t* input_data = reinterpret_cast<const int16_t*>(frame.data.data());
-
-    int samples_per_frame = ctx->audioCodecContext->frame_size;
-    if (samples_per_frame == 0) samples_per_frame = 1024;
-
-    size_t current_size = ctx->audioSampleBuffer.size();
-    size_t new_count = input_samples * frame.channels;
-    ctx->audioSampleBuffer.resize(current_size + new_count);
-    std::memcpy(ctx->audioSampleBuffer.data() + current_size, input_data,
-                new_count * sizeof(int16_t));
-    ctx->lastBufferedTimestamp = frame.timestamp;
-
-    size_t required = samples_per_frame * frame.channels;
-    if (ctx->audioSampleBuffer.size() < required) {
-        return true;  // Buffering
-    }
-
-    int64_t pts = ctx->nextAudioPts;
-
-    // Set up audio frame
-    ctx->audioFrame->nb_samples = samples_per_frame;
-    ctx->audioFrame->format = ctx->audioCodecContext->sample_fmt;
-    ctx->audioFrame->sample_rate = ctx->audioCodecContext->sample_rate;
-    av_channel_layout_copy(&ctx->audioFrame->ch_layout, &ctx->audioCodecContext->ch_layout);
-    ctx->audioFrame->pts = av_rescale_q(pts, {1, 90000}, ctx->audioCodecContext->time_base);
-
-    if (av_frame_get_buffer(ctx->audioFrame, 0) < 0) {
-        return false;
-    }
-
-    // Convert samples to planar float
-    if (needsResampling && ctx->swrContext) {
-        const uint8_t* input_arr[1] = {
-            reinterpret_cast<const uint8_t*>(ctx->audioSampleBuffer.data())};
-        int in_count = samples_per_frame * frame.channels / config_.audioChannels;
-        int out = swr_convert(ctx->swrContext, ctx->audioFrame->data, samples_per_frame, input_arr,
-                              in_count);
-        if (out < 0) return false;
-        ctx->audioFrame->nb_samples = out;
-    } else if (ctx->audioCodecContext->sample_fmt == AV_SAMPLE_FMT_FLTP) {
-        const int16_t* buf = ctx->audioSampleBuffer.data();
-        for (int ch = 0; ch < config_.audioChannels; ch++) {
-            float* out = (float*)ctx->audioFrame->data[ch];
-            for (int i = 0; i < samples_per_frame; i++) {
-                int src_ch = (frame.channels == 1) ? 0 : std::min(ch, frame.channels - 1);
-                out[i] = static_cast<float>(buf[i * frame.channels + src_ch]) / 32768.0f;
+    int count = frame.data.size() / sizeof(int16_t) / frame.channels;
+    const auto* pcm = reinterpret_cast<const int16_t*>(frame.data.data());
+    if (frame.sampleRate != config_.audioSampleRate || frame.channels != config_.audioChannels) {
+        if (!ctx->swrContext) {
+            AVChannelLayout source, destination;
+            av_channel_layout_default(&source, frame.channels);
+            av_channel_layout_default(&destination, config_.audioChannels);
+            int ret = swr_alloc_set_opts2(&ctx->swrContext, &destination, AV_SAMPLE_FMT_S16,
+                                          config_.audioSampleRate, &source, AV_SAMPLE_FMT_S16,
+                                          frame.sampleRate, 0, nullptr);
+            av_channel_layout_uninit(&source);
+            av_channel_layout_uninit(&destination);
+            if (ret < 0 || !ctx->swrContext || swr_init(ctx->swrContext) < 0) {
+                swr_free(&ctx->swrContext);
+                return false;
             }
         }
-        ctx->audioFrame->nb_samples = samples_per_frame;
-    }
-
-    // Consume processed samples
-    size_t consumed = samples_per_frame * frame.channels;
-    if (ctx->audioSampleBuffer.size() > consumed) {
-        std::memmove(ctx->audioSampleBuffer.data(), ctx->audioSampleBuffer.data() + consumed,
-                     (ctx->audioSampleBuffer.size() - consumed) * sizeof(int16_t));
-        ctx->audioSampleBuffer.resize(ctx->audioSampleBuffer.size() - consumed);
+        int capacity = swr_get_out_samples(ctx->swrContext, count);
+        if (capacity < 0) return false;
+        std::vector<int16_t> converted(static_cast<size_t>(capacity) * config_.audioChannels);
+        uint8_t* output[] = {reinterpret_cast<uint8_t*>(converted.data())};
+        const uint8_t* input[] = {frame.data.data()};
+        int produced = swr_convert(ctx->swrContext, output, capacity, input, count);
+        if (produced < 0) return false;
+        ctx->audioSampleBuffer.insert(ctx->audioSampleBuffer.end(), converted.begin(),
+                                      converted.begin() + produced * config_.audioChannels);
     } else {
-        ctx->audioSampleBuffer.clear();
+        ctx->audioSampleBuffer.insert(ctx->audioSampleBuffer.end(), pcm,
+                                      pcm + count * frame.channels);
     }
+    ctx->inputSampleRate = frame.sampleRate;
+    ctx->inputChannels = frame.channels;
+    ctx->lastBufferedTimestamp = frame.timestamp;
+    return writePassthroughAudioSamples(ctx, userId, false);
+}
 
-    ctx->audioFrameCount++;
-    ctx->nextAudioPts += av_rescale_q(samples_per_frame, {1, config_.audioSampleRate}, {1, 90000});
-
-    // Encode and write
-    AVPacket* packet = av_packet_alloc();
-    if (!packet) return false;
-
-    int ret = avcodec_send_frame(ctx->audioCodecContext, ctx->audioFrame);
-    if (ret < 0) {
-        av_packet_free(&packet);
-        return false;
+bool RecordingSink::writePassthroughAudioSamples(PassthroughContext* ctx, const std::string& userId,
+                                                 bool flushPartial) {
+    if (!ctx->audioFrame || ctx->audioCodecContext->sample_fmt != AV_SAMPLE_FMT_FLTP) return false;
+    const int channels = config_.audioChannels;
+    if (flushPartial && ctx->swrContext) {
+        while (true) {
+            int capacity = swr_get_out_samples(ctx->swrContext, 0);
+            if (capacity < 0) return false;
+            if (capacity == 0) break;
+            std::vector<int16_t> tail(static_cast<size_t>(capacity) * channels);
+            uint8_t* output[] = {reinterpret_cast<uint8_t*>(tail.data())};
+            int produced = swr_convert(ctx->swrContext, output, capacity, nullptr, 0);
+            if (produced < 0) return false;
+            if (produced == 0) break;
+            ctx->audioSampleBuffer.insert(ctx->audioSampleBuffer.end(), tail.begin(),
+                                          tail.begin() + produced * channels);
+        }
     }
-
-    while (ret >= 0) {
-        ret = avcodec_receive_packet(ctx->audioCodecContext, packet);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+    const int count = ctx->audioCodecContext->frame_size;
+    if (count <= 0) return false;
+    const size_t required = static_cast<size_t>(count) * channels;
+    while (!ctx->audioSampleBuffer.empty() &&
+           (ctx->audioSampleBuffer.size() >= required || flushPartial)) {
+        if (av_frame_make_writable(ctx->audioFrame) < 0) return false;
+        ctx->audioFrame->nb_samples = count;
+        ctx->audioFrame->pts =
+            av_rescale_q(ctx->nextAudioPts, {1, 90000}, ctx->audioCodecContext->time_base);
+        size_t consumed = std::min(required, ctx->audioSampleBuffer.size());
+        for (int ch = 0; ch < channels; ++ch) {
+            auto* output = reinterpret_cast<float*>(ctx->audioFrame->data[ch]);
+            for (int i = 0; i < count; ++i) {
+                size_t offset = static_cast<size_t>(i) * channels + ch;
+                output[i] = offset < consumed ? ctx->audioSampleBuffer[offset] / 32768.0f : 0.0f;
+            }
+        }
+        AVPacket* packet = av_packet_alloc();
+        if (!packet) return false;
+        int ret = avcodec_send_frame(ctx->audioCodecContext, ctx->audioFrame);
         if (ret < 0) {
             av_packet_free(&packet);
             return false;
         }
-
-        packet->stream_index = ctx->audioStream->index;
-        if (packet->pts != AV_NOPTS_VALUE) {
-            packet->pts = av_rescale_q(packet->pts, ctx->audioCodecContext->time_base,
-                                       ctx->audioStream->time_base);
+        ctx->audioSampleBuffer.erase(ctx->audioSampleBuffer.begin(),
+                                     ctx->audioSampleBuffer.begin() + consumed);
+        ++ctx->audioFrameCount;
+        ctx->nextAudioPts += av_rescale_q(count, {1, config_.audioSampleRate}, {1, 90000});
+        while ((ret = avcodec_receive_packet(ctx->audioCodecContext, packet)) >= 0) {
+            packet->stream_index = ctx->audioStream->index;
+            av_packet_rescale_ts(packet, ctx->audioCodecContext->time_base,
+                                 ctx->audioStream->time_base);
+            if (av_interleaved_write_frame(ctx->formatContext, packet) < 0) {
+                AG_LOG_FAST(ERROR, "Passthrough: failed to write audio for %s", userId.c_str());
+                av_packet_free(&packet);
+                return false;
+            }
+            av_packet_unref(packet);
         }
-        packet->dts = packet->pts;
-
-        int write_ret = av_interleaved_write_frame(ctx->formatContext, packet);
-        if (write_ret < 0) {
-            char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-            av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, write_ret);
-            AG_LOG_FAST(ERROR, "Passthrough: failed to write audio for %s: %s", userId.c_str(),
-                        errbuf);
-        }
-        av_packet_unref(packet);
+        av_packet_free(&packet);
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) return false;
     }
-
-    av_packet_free(&packet);
     return true;
 }
 

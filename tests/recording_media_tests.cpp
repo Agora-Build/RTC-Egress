@@ -137,6 +137,41 @@ class RecordingMediaTest : public ::testing::Test {
         receive();
     }
 
+    void sendEncodedKeyframe(RecordingSink& sink) {
+        AVCodecContext* encoder = avcodec_alloc_context3(avcodec_find_encoder_by_name("libx264"));
+        ASSERT_NE(encoder, nullptr);
+        encoder->width = 160;
+        encoder->height = 120;
+        encoder->pix_fmt = AV_PIX_FMT_YUV420P;
+        encoder->time_base = {1, 25};
+        encoder->max_b_frames = 0;
+        AVDictionary* options = nullptr;
+        av_dict_set(&options, "preset", "ultrafast", 0);
+        av_dict_set(&options, "tune", "zerolatency", 0);
+        ASSERT_GE(avcodec_open2(encoder, encoder->codec, &options), 0);
+        av_dict_free(&options);
+        AVFrame* frame = av_frame_alloc();
+        frame->width = 160;
+        frame->height = 120;
+        frame->format = AV_PIX_FMT_YUV420P;
+        ASSERT_GE(av_frame_get_buffer(frame, 32), 0);
+        for (int ch = 0; ch < 3; ++ch)
+            for (int y = 0; y < (ch == 0 ? 120 : 60); ++y)
+                std::fill_n(frame->data[ch] + y * frame->linesize[ch], ch == 0 ? 160 : 80, 128);
+        ASSERT_GE(avcodec_send_frame(encoder, frame), 0);
+        AVPacket* packet = av_packet_alloc();
+        ASSERT_EQ(avcodec_receive_packet(encoder, packet), 0);
+        EncodedVideoFrameInfo info;
+        info.codecType = VIDEO_CODEC_H264;
+        info.width = 160;
+        info.height = 120;
+        info.frameType = VIDEO_FRAME_TYPE_KEY_FRAME;
+        sink.onEncodedVideoFrame(1001, packet->data, packet->size, info);
+        av_packet_free(&packet);
+        av_frame_free(&frame);
+        avcodec_free_context(&encoder);
+    }
+
     std::filesystem::path outputDir_;
 };
 
@@ -358,6 +393,60 @@ TEST_F(RecordingMediaTest, CompositeRetainsBothUsersAcrossPairedCallbacksAndBrie
     }
     ASSERT_GT(sampledFrames, 10);
     EXPECT_GE(framesWithBothUsers, sampledFrames - 5);
+}
+
+TEST_F(RecordingMediaTest, PassthroughAudioResumeKeepsRtcGap) {
+    auto settings = config();
+    settings.mode = VideoCompositor::Mode::Individual;
+    settings.videoDecodeMode = 0;
+    RecordingSink sink;
+    ASSERT_TRUE(sink.initialize(settings));
+    ASSERT_TRUE(sink.start());
+    sendEncodedKeyframe(sink);
+    uint64_t origin = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+    for (int tick = 0; tick < 10; ++tick) sendTone(sink, "1001", 440, tick, 48000, 2, origin);
+    for (int tick = 60; tick < 70; ++tick) sendTone(sink, "1001", 440, tick, 48000, 2, origin);
+    sink.stop();
+    MediaReader reader;
+    ASSERT_TRUE(reader.open(recording(), AVMEDIA_TYPE_AUDIO));
+    double lastPts = 0;
+    while (av_read_frame(reader.input, reader.packet) >= 0) {
+        if (reader.packet->stream_index == reader.stream && reader.packet->pts != AV_NOPTS_VALUE)
+            lastPts = reader.packet->pts * av_q2d(reader.input->streams[reader.stream]->time_base);
+        av_packet_unref(reader.packet);
+    }
+    EXPECT_GT(lastPts, 0.65);
+    EXPECT_LT(lastPts, 0.75);
+    std::vector<float> samples;
+    decodeAudio(samples);
+    EXPECT_NEAR(samples.size() / 48000.0, 0.2, 0.05);
+    EXPECT_GT(toneAmplitude(samples, 440, 0.02, 0.08), 0.14);
+}
+
+TEST_F(RecordingMediaTest, PassthroughResamplesAndDrainsLargeAcceptedAudioCallback) {
+    auto settings = config();
+    settings.mode = VideoCompositor::Mode::Individual;
+    settings.videoDecodeMode = 0;
+    RecordingSink sink;
+    ASSERT_TRUE(sink.initialize(settings));
+    ASSERT_TRUE(sink.start());
+    sendEncodedKeyframe(sink);
+    std::vector<int16_t> pcm(4800);
+    for (size_t i = 0; i < pcm.size(); ++i)
+        pcm[i] = static_cast<int16_t>(6000 * std::sin(2 * kPi * 440 * i / 24000));
+    uint64_t origin = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+    sink.onAudioFrame(reinterpret_cast<const uint8_t*>(pcm.data()), pcm.size(), 24000, 1, origin,
+                      "1001");
+    sink.stop();
+    std::vector<float> samples;
+    decodeAudio(samples);
+    EXPECT_GE(samples.size(), 9600u);
+    EXPECT_NEAR(samples.size() / 48000.0, 0.2, 0.025);
+    EXPECT_GT(toneAmplitude(samples, 440, 0.05, 0.15), 0.12);
 }
 
 TEST_F(RecordingMediaTest, CompositorHonorsFrameExpiryAndImmediatelyRestoresReturningPublisher) {

@@ -17,6 +17,7 @@ ctest --test-dir build/tests -R '^RecordingThreadTests$' --output-on-failure
 - A late publisher with a different sample rate and channel count, followed by departure.
 - Immediate shutdown with queued PCM and a partial AAC frame.
 - Real H264 passthrough, AAC finalization, the last video frame, and file metadata.
+- Passthrough audio pause/resume timing and draining a large resampled callback.
 - Paired video callbacks and a brief gap in one publisher's video.
 - Explicit frame expiry and immediate restoration when a publisher returns.
 

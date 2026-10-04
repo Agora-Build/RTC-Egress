@@ -154,6 +154,8 @@ class RecordingSink {
         AVStream* audioStream = nullptr;
         AVCodecContext* audioCodecContext = nullptr;
         SwrContext* swrContext = nullptr;
+        int inputSampleRate = 0;
+        int inputChannels = 0;
         AVFrame* audioFrame = nullptr;
         std::string filename;
         std::chrono::system_clock::time_point createdAt = std::chrono::system_clock::now();
@@ -270,6 +272,8 @@ class RecordingSink {
     void cleanupPassthroughContext(const std::string& userId);
     bool encodePassthroughAudioFrame(const AudioFrame& frame, PassthroughContext* ctx,
                                      const std::string& userId);
+    bool writePassthroughAudioSamples(PassthroughContext* ctx, const std::string& userId,
+                                      bool flushPartial);
 
     // Utilities
     std::string generateOutputFilename(const std::string& userId = "");
