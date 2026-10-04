@@ -571,6 +571,8 @@ void TaskPipe::handleStreamingCommand(const std::string& action, const UDSMessag
         config.regions = msg.regions;
         if (msg.width) config.width = msg.width;
         if (msg.height) config.height = msg.height;
+        // Reap a completed publishing thread before reusing the idle sink.
+        streaming_sink_.stop();
         streaming_sink_.setCompletionCallback([this](const std::string& taskId,
                                                      const std::string& status,
                                                      const std::string& message) {
@@ -593,9 +595,9 @@ void TaskPipe::handleStreamingCommand(const std::string& action, const UDSMessag
         rtc_client_->config().videoDecodeMode = msg.videoDecodeMode == 2
                                                     ? agora::rtc::VideoDecodeMode::SdkDecode
                                                     : agora::rtc::VideoDecodeMode::FfmpegDecode;
-        if (!streaming_sink_.initialize(config) || !streaming_sink_.start()) {
+        if (!streaming_sink_.initialize(config)) {
             streaming_sink_.stop();
-            sendCompletionMessage(msg.task_id, "failed", "Failed to connect streaming destination");
+            sendCompletionMessage(msg.task_id, "failed", "Invalid streaming configuration");
             return;
         }
         if (!ensureConnected(msg.channel, msg.access_token)) {
@@ -606,6 +608,12 @@ void TaskPipe::handleStreamingCommand(const std::string& action, const UDSMessag
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             channel_states_[msg.channel].active_tasks[msg.task_id] = msg.cmd;
+        }
+        // Startup can fail asynchronously, so completion must find the registered task.
+        if (!streaming_sink_.start()) {
+            releaseConnection(msg.channel, msg.task_id);
+            sendCompletionMessage(msg.task_id, "failed", "Failed to start streaming publisher");
+            return;
         }
         logInfo("Started " + msg.cmd + " publishing for task: " + msg.task_id, instance_id_);
     } else if (action == "stop") {

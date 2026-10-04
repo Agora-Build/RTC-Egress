@@ -5,11 +5,19 @@ A high-performance egress service solution for Agora RTC streams, with support f
 ## Features
 
 - Record Agora RTC streams with configurable quality
+- Publish native composite streams over RTMP (H264/AAC) or WHIP (H264/Opus)
+- Retry initial and interrupted destinations, with WHIP ICE liveness checks
 - Save video frames as images at regular intervals
 - HTTP API for controlling the recording process
 - Built-in health checks
 - S3 integration for storing recorded media
 - Containerized deployment with Docker or Kubernetes
+
+Native recording and publishing support `flat`, `spotlight`, and `customized`
+layouts. `freestyle` routes to the external web recorder. RTMP and WHIP are
+streaming protocols; they do not create local recording files. See
+[Native Streaming Outputs](designs/streaming_output_design.md) for API examples,
+retry settings, WHIP timeout behavior, build requirements, and end-to-end tests.
 
 ## Architecture
 

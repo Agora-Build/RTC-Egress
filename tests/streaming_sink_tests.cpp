@@ -81,7 +81,7 @@ TEST(StreamingSinkTest, StopInterruptsStalledInitialHandshake) {
     }
     auto stopped = std::chrono::steady_clock::now();
     sink.stop();
-    EXPECT_FALSE(starting.get());
+    EXPECT_TRUE(starting.get());
     EXPECT_FALSE(sink.hasFailed());
     EXPECT_LT(std::chrono::steady_clock::now() - stopped, std::chrono::seconds(2));
     peer.get();
@@ -102,20 +102,78 @@ TEST(StreamingSinkTest, RejectsInvalidCanvasBeforeConnecting) {
     EXPECT_FALSE(sink.initialize(config));
 }
 
-TEST(StreamingSinkTest, ConnectionFailureIsBoundedAndDoesNotBecomeActive) {
+TEST(StreamingSinkTest, InitialConnectionRetriesAndReportsExhaustionAsynchronously) {
+    std::promise<std::string> completion;
+    auto result = completion.get_future();
     StreamingSink sink;
     StreamingSink::Config config;
     config.width = 320;
     config.height = 180;
     config.output.url = "rtmp://127.0.0.1:1/live/test";
     config.output.timeoutMs = 1000;
+    config.reconnectAttempts = 2;
+    config.reconnectDelayMs = 100;
+    sink.setCompletionCallback(
+        [&](const std::string&, const std::string& status, const std::string& message) {
+            completion.set_value(status + ": " + message);
+        });
     ASSERT_TRUE(sink.initialize(config));
     auto started = std::chrono::steady_clock::now();
-    EXPECT_FALSE(sink.start());
+    EXPECT_TRUE(sink.start());
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::milliseconds(250));
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_EQ(result.get(), "failed: Streaming destination reconnect exhausted after 2 attempts");
     EXPECT_TRUE(sink.hasFailed());
     EXPECT_FALSE(sink.isStreaming());
     sink.stop();
     EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+}
+
+TEST(StreamingSinkTest, StopInterruptsInitialRetryDelayWithoutFailureCallback) {
+    std::atomic<bool> completed{false};
+    StreamingSink sink;
+    StreamingSink::Config config;
+    config.width = 320;
+    config.height = 180;
+    config.output.url = "rtmp://127.0.0.1:1/live/test";
+    config.reconnectDelayMs = 10000;
+    sink.setCompletionCallback(
+        [&](const std::string&, const std::string&, const std::string&) { completed = true; });
+    ASSERT_TRUE(sink.initialize(config));
+    ASSERT_TRUE(sink.start());
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!sink.isReconnecting() && sink.isStreaming() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(sink.isReconnecting());
+    auto stopped = std::chrono::steady_clock::now();
+    sink.stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - stopped, std::chrono::seconds(1));
+    EXPECT_FALSE(sink.hasFailed());
+    EXPECT_FALSE(completed);
+}
+
+TEST(StreamingSinkTest, DisabledRetriesReportInitialFailureExactlyOnce) {
+    std::atomic<int> callbacks{0};
+    std::promise<std::string> completion;
+    auto result = completion.get_future();
+    StreamingSink sink;
+    StreamingSink::Config config;
+    config.width = 320;
+    config.height = 180;
+    config.output.url = "rtmp://127.0.0.1:1/live/test";
+    config.reconnectAttempts = 0;
+    sink.setCompletionCallback(
+        [&](const std::string&, const std::string& status, const std::string& message) {
+            if (++callbacks == 1) completion.set_value(status + ": " + message);
+            sink.stop();
+        });
+    ASSERT_TRUE(sink.initialize(config));
+    ASSERT_TRUE(sink.start());
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(result.get(), "failed: Streaming destination reconnect exhausted after 0 attempts");
+    sink.stop();
+    EXPECT_EQ(callbacks, 1);
 }
 
 TEST(StreamingSinkTest, RejectsWhipTokenOnRtmp) {
@@ -135,6 +193,8 @@ TEST(StreamingSinkTest, RejectsUnsupportedLayoutBeforeConnecting) {
 }
 
 TEST(StreamingSinkTest, StalledRtmpHandshakeHonorsDeadline) {
+    std::promise<std::string> completion;
+    auto result = completion.get_future();
     int server = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(server, 0);
     sockaddr_in address{};
@@ -161,9 +221,16 @@ TEST(StreamingSinkTest, StalledRtmpHandshakeHonorsDeadline) {
     config.output.url =
         "rtmp://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/live/test";
     config.output.timeoutMs = 1000;
+    config.maxDurationSeconds = 1;
+    sink.setCompletionCallback(
+        [&](const std::string&, const std::string& status, const std::string& message) {
+            completion.set_value(status + ": " + message);
+        });
     ASSERT_TRUE(sink.initialize(config));
     auto started = std::chrono::steady_clock::now();
-    EXPECT_FALSE(sink.start());
+    EXPECT_TRUE(sink.start());
+    ASSERT_EQ(result.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_EQ(result.get(), "success: Streaming duration reached");
     sink.stop();
     EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
     peer.get();

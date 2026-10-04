@@ -7,6 +7,7 @@
 #include "common/log.h"
 
 extern "C" {
+#include <libavutil/opt.h>
 #include <libavutil/time.h>
 }
 
@@ -33,7 +34,17 @@ bool StreamingOutput::validate(const Config& config) {
     auto authorityEnd = url.find_first_of("/?", authorityStart);
     auto authority = url.substr(authorityStart, authorityEnd - authorityStart);
     if (authority.empty() || authority.front() == ':' || authority.front() == '@') return false;
-    return av_guess_format(config.protocol == Protocol::RTMP ? "flv" : "whip", nullptr, nullptr);
+    const auto* format =
+        av_guess_format(config.protocol == Protocol::RTMP ? "flv" : "whip", nullptr, nullptr);
+    if (!format) return false;
+    const AVClass* backendClass = format->priv_class;
+    if (config.protocol == Protocol::WHIP &&
+        (!backendClass ||
+         !av_opt_find(&backendClass, "consent_timeout", nullptr, 0, AV_OPT_SEARCH_FAKE_OBJ))) {
+        AG_LOG(ERROR, "WHIP requires the pinned FFmpeg backend with ICE consent support");
+        return false;
+    }
+    return true;
 }
 
 void StreamingOutput::setDeadline(int timeoutMs) {
@@ -91,6 +102,7 @@ bool StreamingOutput::open(const Config& config, const AVCodecContext* video,
     if (config.protocol == Protocol::WHIP) {
         context_->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
         av_dict_set_int(&options, "handshake_timeout", config.timeoutMs, 0);
+        av_dict_set_int(&options, "consent_timeout", config.timeoutMs, 0);
         if (!config.token.empty()) av_dict_set(&options, "authorization", config.token.c_str(), 0);
     }
     setDeadline(config.timeoutMs);
@@ -101,6 +113,7 @@ bool StreamingOutput::open(const Config& config, const AVCodecContext* video,
         return false;
     }
     headerWritten_ = true;
+    nextPollUs_ = 0;
     return true;
 }
 
@@ -110,7 +123,18 @@ bool StreamingOutput::write(AVPacket* packet, bool video, AVRational timeBase) {
     av_packet_rescale_ts(packet, timeBase, stream->time_base);
     packet->stream_index = stream->index;
     setDeadline(config_.timeoutMs);
-    return av_interleaved_write_frame(context_, packet) >= 0;
+    // RTP streams carry independent clocks; direct writes also allow idle WHIP flush polling.
+    // Use only av_write_frame for WHIP, since FFmpeg forbids mixing its write APIs.
+    return (config_.protocol == Protocol::WHIP ? av_write_frame(context_, packet)
+                                               : av_interleaved_write_frame(context_, packet)) >= 0;
+}
+
+bool StreamingOutput::poll() {
+    if (!headerWritten_ || cancelled_ || (stopping_ && stopping_->load())) return false;
+    if (config_.protocol != Protocol::WHIP || av_gettime_relative() < nextPollUs_) return true;
+    nextPollUs_ = av_gettime_relative() + 100000;
+    setDeadline(config_.timeoutMs);
+    return av_write_frame(context_, nullptr) >= 0;
 }
 
 void StreamingOutput::cancel() {

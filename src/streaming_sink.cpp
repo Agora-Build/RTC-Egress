@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <system_error>
 
 #include "common/log.h"
 
@@ -74,14 +75,15 @@ bool StreamingSink::start() {
         std::chrono::steady_clock::now() + std::chrono::seconds(config_.maxDurationSeconds);
     taskDeadlineUs_ =
         av_gettime_relative() + static_cast<int64_t>(config_.maxDurationSeconds) * 1000000;
-    if (!openSession()) {
-        failed_ = !stopping_.load();
-        output_.close();
-        releaseCodecs();
+    active_ = true;
+    try {
+        thread_ = std::thread(&StreamingSink::run, this);
+    } catch (const std::system_error& error) {
+        active_ = false;
+        failed_ = true;
+        AG_LOG(ERROR, "Cannot start publishing thread: %s", error.what());
         return false;
     }
-    active_ = true;
-    thread_ = std::thread(&StreamingSink::run, this);
     return true;
 }
 
@@ -250,7 +252,10 @@ void StreamingSink::run() {
         std::lock_guard<std::mutex> lock(mutex_);
         workerId_ = std::this_thread::get_id();
     }
-    while (!stopping_ && !failed_) {
+    bool connected = openSession();
+    if (!connected && outputFailed_ && !stopping_ && !durationReached()) connected = reconnect();
+    if (!connected && !stopping_ && !durationReached()) failed_ = true;
+    while (connected && !stopping_ && !failed_) {
         if (durationReached()) break;
         FramePtr frame;
         {
@@ -285,6 +290,10 @@ void StreamingSink::run() {
             mediaOk = mixer_.drain(audio_->frame_size, false, [this](const AudioFrame& pcm) {
                 return !stopping_.load() && encodeAudio(pcm);
             });
+        if (mediaOk && !failed_ && !stopping_ && !output_.poll()) {
+            outputFailed_ = true;
+            mediaOk = false;
+        }
         if (!mediaOk && !stopping_ && !durationReached()) {
             // Recover after AudioMixer::drain unwinds, before replacing codecs or clearing PCM.
             if (outputFailed_) {

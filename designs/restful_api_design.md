@@ -2,6 +2,32 @@
 
 ## Start Task
 
+### Native Streaming (RTMP / WHIP)
+
+Submit `cmd: "rtmp"` or `cmd: "whip"` with `action: "start"` to the same task
+endpoint. The payload accepts the native channel, user selection, decode mode,
+and `flat`, `spotlight`, or `customized` layout settings. Publishing uses decoded
+composite media; `freestyle` is handled by the external web recorder.
+
+| Payload field | Behavior |
+| --- | --- |
+| `output_url` | Required; `rtmp://` or `rtmps://` for RTMP, `http://` or `https://` for WHIP |
+| `output_token` | Optional WHIP bearer token; rejected for RTMP |
+| `output_timeout_ms` | 1000-30000, default 5000; network operation timeout and WHIP ICE liveness timeout |
+| `output_reconnect_attempts` | 0-20, default 5; retries after the original attempt; zero disables retries |
+| `output_reconnect_delay_ms` | 100-10000, default 1000; initial delay doubles to a 10-second cap |
+
+Startup and reconnect run asynchronously. The task stays PROCESSING while the
+destination is unavailable and retains its Agora connection. Retries apply to
+initial failures and established transport failures, including a silent WHIP UDP
+outage detected by authenticated ICE probes. Exhaustion produces FAILED. The
+existing stop endpoint interrupts backoff and handshakes and completes STOPPED;
+maximum task duration also includes destination downtime. Streams create no local
+recording files or recording metadata.
+
+See [Native Streaming Outputs](streaming_output_design.md) for request examples,
+timing bounds, recovery behavior, and the patched FFmpeg requirement.
+
 ### (Native) curl -X POST http://localhost:8091/egress/v1/{app_id}/tasks \
     -H "Content-Type: application/json" \
     -d '{
