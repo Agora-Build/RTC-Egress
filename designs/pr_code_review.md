@@ -43,8 +43,9 @@ Do not put credential values in documentation, review artifacts, or memory.
    and receives no provider credentials. The publisher treats model output as
    text and never executes it.
 
-Provider-backed reviews run only for same-repository PRs authored by an
-`OWNER`, `MEMBER`, or `COLLABORATOR`. Fork PRs and other authors are skipped.
+An authorization job checks the author's actual repository permission through
+GitHub's API. Provider-backed reviews run only for same-repository PRs whose
+author has `admin`, `maintain`, or `write` access. Fork PRs and other authors are skipped.
 The publisher also runs code from that trusted PR, so this author restriction
 applies to both model access and publication. The standalone workflow tests
 run without provider credentials, including on fork PRs.

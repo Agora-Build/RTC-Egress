@@ -9,10 +9,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      trusted: ${{ steps.access.outputs.trusted }}
+    steps:
+      - name: Check PR author access
+        id: access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (pr.head.repo?.id !== pr.base.repo.id) {
+              core.setOutput('trusted', 'false');
+              core.info('Skipping provider review for a fork PR.');
+              return;
+            }
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo, username: pr.user.login,
+            });
+            const trusted = ['admin', 'maintain', 'write'].includes(data.permission);
+            core.info(`Author ${pr.user.login} has repository permission: ${data.permission}`);
+            core.setOutput('trusted', String(trusted));
+
   review:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+    needs: authorize
+    if: needs.authorize.outputs.trusted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
