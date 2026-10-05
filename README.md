@@ -300,6 +300,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
+Codex and Claude publish automated reviews on trusted PRs. See the
+[PR review setup](designs/pr_code_review.md) for provider secrets, publication
+checks, and workflow tests.
+
 ## Support
 
 For support, please open an issue in the GitHub repository.
